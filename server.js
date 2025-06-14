@@ -157,13 +157,15 @@ app.post('/chat', async (req, res) => {
       content: message
     });
 
-    // Create run with simplified context for structured sequences
+    // Create run with file search instructions
     let additionalInstructions = '';
     if (context && context.includes('structured question sequence')) {
       // For structured sequences, keep it simple
-      additionalInstructions = 'You are responding to an answer in a structured coaching sequence. Give a brief, encouraging response that acknowledges their answer and may reference previous responses for patterns, but do not ask follow-up questions.';
+      additionalInstructions = 'You are responding to an answer in a structured coaching sequence. Give a brief, encouraging response that acknowledges their answer and may reference previous responses for patterns, but do not ask follow-up questions. Search your attached files for relevant course material to inform your response.';
     } else if (context && context.includes('Current path:')) {
-      additionalInstructions = `Context: ${context}`;
+      additionalInstructions = `${context}. Always search through your attached course files and reference relevant content when applicable.`;
+    } else {
+      additionalInstructions = 'Search through your attached course files and reference relevant content from the uploaded materials when responding to the user\'s question.';
     }
 
     const run = await openai.beta.threads.runs.create(threadId, {
@@ -341,6 +343,37 @@ app.get('/health', (req, res) => {
     assistant: assistantId ? 'ready' : 'not created',
     timestamp: new Date().toISOString()
   });
+});
+
+// Debug endpoint to see assistant configuration
+app.get('/debug-assistant', async (req, res) => {
+  try {
+    if (!assistantId) {
+      return res.json({ error: 'No assistant ID' });
+    }
+
+    const assistant = await openai.beta.assistants.retrieve(assistantId);
+    
+    // Get all files uploaded to OpenAI
+    const allFiles = await openai.files.list({ purpose: 'assistants' });
+    
+    res.json({
+      assistant_id: assistantId,
+      assistant_name: assistant.name,
+      tools: assistant.tools,
+      tool_resources: assistant.tool_resources,
+      file_ids: assistant.file_ids || [],
+      all_uploaded_files: allFiles.data.map(f => ({
+        id: f.id,
+        filename: f.filename,
+        size: f.bytes,
+        created_at: f.created_at
+      }))
+    });
+  } catch (error) {
+    console.error('Debug error:', error);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // Test OpenAI connectivity
