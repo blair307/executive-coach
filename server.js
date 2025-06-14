@@ -46,7 +46,9 @@ async function createAssistant() {
 
 You operate with deep psychological insight, system-level thinking, and a firm but compassionate tone. You help people break through self-sabotage, false identities, and emotional drift. You do not tolerate excuses, victim thinking, or surface-level quick fixes. You are direct, tough, strategic—and always rooting for their greatness.
 
-IMPORTANT: You are having a natural coaching conversation. Respond to what the person just said as you naturally would - with insight, challenges, follow-up questions, or observations. Be conversational, insightful, and responsive to their specific words and energy. Ask follow-up questions when appropriate. Challenge them when they need it. Celebrate breakthroughs when you sense them.
+IMPORTANT: You have access to course materials and documents that have been uploaded to your knowledge base. When users ask questions, always search through these materials first to provide course-specific guidance. Reference the uploaded documents when relevant, and base your advice on the frameworks and content from the course materials.
+
+You are having a natural coaching conversation. Respond to what the person just said as you naturally would - with insight, challenges, follow-up questions, or observations. Be conversational, insightful, and responsive to their specific words and energy. Ask follow-up questions when appropriate. Challenge them when they need it. Celebrate breakthroughs when you sense them.
 
 When users are in structured question sequences (Identity & Calling or Personal Relationships), acknowledge their answers naturally but avoid asking follow-up questions since the next question is predetermined. Keep responses brief and encouraging during these sequences, but draw connections between their current answer and previous responses when relevant.`,
       tools: [{ type: "file_search" }],
@@ -270,30 +272,63 @@ app.get('/course-files', async (req, res) => {
       return res.json({ files: [] });
     }
 
+    // Get assistant details
     const assistant = await openai.beta.assistants.retrieve(assistantId);
+    console.log('Assistant tool resources:', JSON.stringify(assistant.tool_resources, null, 2));
+    
     const vectorStoreIds = assistant.tool_resources?.file_search?.vector_store_ids || [];
+    console.log('Vector store IDs:', vectorStoreIds);
     
     if (vectorStoreIds.length === 0) {
+      console.log('No vector stores found for assistant');
       return res.json({ files: [] });
     }
 
-    const files = await openai.beta.vectorStores.files.list(vectorStoreIds[0]);
-    const fileDetails = await Promise.all(
-      files.data.map(async (file) => {
-        const fileInfo = await openai.files.retrieve(file.id);
-        return {
-          id: file.id,
-          filename: fileInfo.filename,
-          size: fileInfo.bytes,
-          created_at: fileInfo.created_at
-        };
-      })
-    );
+    // Get files from first vector store
+    const vectorStoreId = vectorStoreIds[0];
+    console.log('Checking vector store:', vectorStoreId);
+    
+    try {
+      const vectorStoreFiles = await openai.beta.vectorStores.files.list(vectorStoreId);
+      console.log('Vector store files:', vectorStoreFiles.data.length);
+      
+      if (vectorStoreFiles.data.length === 0) {
+        return res.json({ files: [] });
+      }
 
-    res.json({ files: fileDetails });
+      const fileDetails = await Promise.all(
+        vectorStoreFiles.data.map(async (vectorFile) => {
+          try {
+            const fileInfo = await openai.files.retrieve(vectorFile.id);
+            return {
+              id: vectorFile.id,
+              filename: fileInfo.filename,
+              size: fileInfo.bytes,
+              created_at: fileInfo.created_at,
+              status: vectorFile.status || 'active'
+            };
+          } catch (fileError) {
+            console.error('Error retrieving file info:', fileError);
+            return {
+              id: vectorFile.id,
+              filename: 'Unknown file',
+              size: 0,
+              created_at: Date.now() / 1000,
+              status: 'error'
+            };
+          }
+        })
+      );
+
+      res.json({ files: fileDetails });
+    } catch (vectorStoreError) {
+      console.error('Error accessing vector store:', vectorStoreError);
+      return res.json({ files: [] });
+    }
+
   } catch (error) {
     console.error('Error listing files:', error);
-    res.status(500).json({ error: 'Failed to list course files' });
+    res.status(500).json({ error: 'Failed to list course files', details: error.message });
   }
 });
 
@@ -304,6 +339,36 @@ app.get('/health', (req, res) => {
     assistant: assistantId ? 'ready' : 'not created',
     timestamp: new Date().toISOString()
   });
+});
+
+// Debug endpoint to see assistant configuration
+app.get('/debug-assistant', async (req, res) => {
+  try {
+    if (!assistantId) {
+      return res.json({ error: 'No assistant ID' });
+    }
+
+    const assistant = await openai.beta.assistants.retrieve(assistantId);
+    
+    // Get all files uploaded to OpenAI
+    const allFiles = await openai.files.list({ purpose: 'assistants' });
+    
+    res.json({
+      assistant_id: assistantId,
+      assistant_name: assistant.name,
+      tools: assistant.tools,
+      tool_resources: assistant.tool_resources,
+      all_uploaded_files: allFiles.data.map(f => ({
+        id: f.id,
+        filename: f.filename,
+        size: f.bytes,
+        created_at: f.created_at
+      }))
+    });
+  } catch (error) {
+    console.error('Debug error:', error);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
