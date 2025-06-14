@@ -352,41 +352,81 @@ app.get('/force-attach-files', async (req, res) => {
       return res.status(400).json({ error: 'No assistant available' });
     }
 
-    console.log('Force attaching files directly...');
+    console.log('Force attaching files with modern API...');
 
     // Get files
     const allFiles = await openai.files.list({ purpose: 'assistants' });
     const fileIds = allFiles.data.slice(0, 20).map(f => f.id); // OpenAI limit is 20 files
 
-    console.log(`Attempting to attach ${fileIds.length} files directly`);
-    console.log('File IDs:', fileIds);
+    console.log(`Attempting to attach ${fileIds.length} files`);
 
-    // Simple direct update - just file_ids and tools
-    const updateResult = await openai.beta.assistants.update(assistantId, {
-      file_ids: fileIds,
-      tools: [{ type: "retrieval" }] // Use older retrieval tool name
-    });
-
-    console.log('Update successful');
-    console.log('Result file_ids length:', updateResult.file_ids?.length || 0);
-
-    // Verify immediately
-    const verifyAssistant = await openai.beta.assistants.retrieve(assistantId);
-    
-    res.json({
-      success: true,
-      message: `Force attached ${fileIds.length} files`,
-      attempted_files: fileIds.length,
-      actual_attached: verifyAssistant.file_ids?.length || 0,
-      file_ids_preview: verifyAssistant.file_ids?.slice(0, 3) || [],
-      tools: verifyAssistant.tools
-    });
+    // Modern approach: Use file_search tool with tool_resources
+    try {
+      console.log('Trying modern file_search with tool_resources...');
+      
+      // First create a vector store with the files
+      let vectorStoreId = null;
+      try {
+        if (openai.beta && openai.beta.vectorStores && openai.beta.vectorStores.create) {
+          const vectorStore = await openai.beta.vectorStores.create({
+            name: `Course Materials ${Date.now()}`,
+            file_ids: fileIds.slice(0, 10) // Start with 10 files
+          });
+          vectorStoreId = vectorStore.id;
+          console.log('Vector store created:', vectorStoreId);
+        }
+      } catch (vsError) {
+        console.log('Vector store creation failed, trying direct file attachment');
+      }
+      
+      // Update assistant with the appropriate method
+      let updateData;
+      if (vectorStoreId) {
+        // Use vector store approach
+        updateData = {
+          tools: [{ type: "file_search" }],
+          tool_resources: {
+            file_search: {
+              vector_store_ids: [vectorStoreId]
+            }
+          }
+        };
+      } else {
+        // Try direct file_ids (might work with newer API)
+        updateData = {
+          tools: [{ type: "file_search" }],
+          file_ids: fileIds
+        };
+      }
+      
+      const updateResult = await openai.beta.assistants.update(assistantId, updateData);
+      console.log('Assistant update successful');
+      
+      // Verify the result
+      const verifyAssistant = await openai.beta.assistants.retrieve(assistantId);
+      
+      res.json({
+        success: true,
+        message: `Successfully attached files using ${vectorStoreId ? 'vector store' : 'direct file_ids'}`,
+        attempted_files: fileIds.length,
+        vector_store_id: vectorStoreId,
+        actual_file_ids: verifyAssistant.file_ids?.length || 0,
+        vector_stores: verifyAssistant.tool_resources?.file_search?.vector_store_ids || [],
+        tools: verifyAssistant.tools,
+        method: vectorStoreId ? 'vector_store' : 'direct_file_ids'
+      });
+      
+    } catch (modernError) {
+      console.error('Modern approach failed:', modernError.message);
+      throw modernError;
+    }
 
   } catch (error) {
     console.error('Force attach error:', error);
     res.status(500).json({
       error: 'Force attach failed',
-      details: error.message
+      details: error.message,
+      api_error: error.response?.data || 'No additional API error info'
     });
   }
 });
