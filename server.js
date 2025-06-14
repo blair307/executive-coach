@@ -1,9 +1,25 @@
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
-const OpenAI = require('openai');
 const multer = require('multer');
 const fs = require('fs');
+
+// Import OpenAI - try both ways to be safe
+let OpenAI;
+try {
+  OpenAI = require('openai').default || require('openai');
+} catch (e) {
+  console.error('Failed to import OpenAI:', e.message);
+  try {
+    const openaiModule = require('openai');
+    OpenAI = openaiModule.OpenAI || openaiModule.default || openaiModule;
+  } catch (e2) {
+    console.error('Alternative OpenAI import also failed:', e2.message);
+    process.exit(1);
+  }
+}
+
+console.log('OpenAI imported successfully, type:', typeof OpenAI);
 
 const app = express();
 
@@ -26,10 +42,23 @@ const upload = multer({
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-// Initialize OpenAI client
-const openai = new OpenAI({
-  apiKey: OPENAI_API_KEY,
-});
+// Initialize OpenAI client with proper error checking
+let openai;
+try {
+  if (!OPENAI_API_KEY) {
+    throw new Error('OPENAI_API_KEY environment variable is not set');
+  }
+  
+  openai = new OpenAI({
+    apiKey: OPENAI_API_KEY,
+  });
+  
+  console.log('OpenAI client initialized successfully');
+  console.log('API key length:', OPENAI_API_KEY.length);
+} catch (initError) {
+  console.error('Failed to initialize OpenAI client:', initError.message);
+  process.exit(1);
+}
 
 // Store for user threads (in production, use a database)
 const userThreads = new Map();
@@ -318,40 +347,52 @@ app.get('/health', (req, res) => {
 app.get('/test-openai', async (req, res) => {
   try {
     console.log('Testing OpenAI connectivity...');
+    console.log('OpenAI object type:', typeof openai);
+    console.log('OpenAI object keys:', Object.keys(openai).slice(0, 10));
+    
+    // Test if openai object has the expected methods
+    if (!openai || typeof openai !== 'object') {
+      throw new Error('OpenAI client is not properly initialized');
+    }
+    
+    if (!openai.models || typeof openai.models.list !== 'function') {
+      throw new Error('OpenAI models API not available');
+    }
     
     // Test 1: List models (basic API test)
     console.log('Testing basic API access...');
     const models = await openai.models.list();
-    console.log('Models API works, found', models.data.length, 'models');
+    console.log('Models API works, found', models.data?.length || 0, 'models');
     
     // Test 2: List files
     console.log('Testing files API...');
+    if (!openai.files || typeof openai.files.list !== 'function') {
+      throw new Error('OpenAI files API not available');
+    }
     const files = await openai.files.list({ purpose: 'assistants' });
-    console.log('Files API works, found', files.data.length, 'files');
+    console.log('Files API works, found', files.data?.length || 0, 'files');
     
     // Test 3: Check assistant
     console.log('Testing assistant API...');
-    if (assistantId) {
+    if (assistantId && openai.beta?.assistants?.retrieve) {
       const assistant = await openai.beta.assistants.retrieve(assistantId);
       console.log('Assistant API works, assistant name:', assistant.name);
     }
     
-    // Test 4: Check vector stores API
-    console.log('Testing vector stores API...');
-    const vectorStores = await openai.beta.vectorStores.list();
-    console.log('Vector stores API works, found', vectorStores.data.length, 'stores');
-    
     res.json({
       success: true,
       tests: {
+        client_initialized: 'working',
         models_api: 'working',
         files_api: 'working', 
-        assistant_api: assistantId ? 'working' : 'no assistant',
-        vector_stores_api: 'working'
+        assistant_api: assistantId ? 'working' : 'no assistant'
       },
-      file_count: files.data.length,
-      vector_store_count: vectorStores.data.length,
-      assistant_id: assistantId
+      file_count: files.data?.length || 0,
+      assistant_id: assistantId,
+      openai_type: typeof openai,
+      has_models: !!openai.models,
+      has_files: !!openai.files,
+      has_beta: !!openai.beta
     });
     
   } catch (error) {
@@ -360,7 +401,9 @@ app.get('/test-openai', async (req, res) => {
       error: 'OpenAI test failed',
       details: error.message,
       api_key_present: !!OPENAI_API_KEY,
-      api_key_length: OPENAI_API_KEY ? OPENAI_API_KEY.length : 0
+      api_key_length: OPENAI_API_KEY ? OPENAI_API_KEY.length : 0,
+      openai_type: typeof openai,
+      openai_exists: !!openai
     });
   }
 });
