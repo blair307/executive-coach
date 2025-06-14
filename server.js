@@ -3,7 +3,11 @@ const cors = require('cors');
 const path = require('path');
 const app = express();
 
-app.use(cors());
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -12,6 +16,10 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 app.post('/chat', async (req, res) => {
   try {
     const { message, context } = req.body;
+    
+    if (!message) {
+      return res.status(400).json({ error: 'Message is required' });
+    }
     
     const response = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
@@ -43,11 +51,29 @@ Ask ONE question at a time and wait for responses. Challenge users to go deeper,
     });
 
     const data = await response.json();
+    
+    // Better error handling
+    if (!response.ok) {
+      console.error('OpenAI API Error:', data);
+      return res.status(response.status).json({ 
+        error: data.error?.message || 'OpenAI API error' 
+      });
+    }
+    
+    if (!data.choices || !data.choices[0] || !data.choices[0].message) {
+      console.error('Unexpected OpenAI response:', data);
+      return res.status(500).json({ 
+        error: 'Unexpected response from AI service' 
+      });
+    }
+    
     res.json({ message: data.choices[0].message.content });
     
   } catch (error) {
-    console.error('Error:', error);
-    res.status(500).json({ error: 'Something went wrong' });
+    console.error('Server Error:', error);
+    res.status(500).json({ 
+      error: 'Something went wrong. Please try again.' 
+    });
   }
 });
 
