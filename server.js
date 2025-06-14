@@ -2,6 +2,8 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const OpenAI = require('openai');
+const multer = require('multer');
+const fs = require('fs');
 
 const app = express();
 
@@ -13,6 +15,14 @@ app.use(cors({
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
+
+// Configure multer for file uploads
+const upload = multer({ 
+  dest: 'uploads/',
+  limits: {
+    fileSize: 50 * 1024 * 1024 // 50MB limit
+  }
+});
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
@@ -154,6 +164,121 @@ app.post('/chat', async (req, res) => {
     res.status(500).json({ 
       error: 'Something went wrong. Please try again.' 
     });
+  }
+});
+
+// File upload endpoint
+app.post('/upload-course-material', upload.single('courseFile'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    console.log('Uploading file:', req.file.originalname);
+
+    // Upload file to OpenAI
+    const fileStream = fs.createReadStream(req.file.path);
+    const file = await openai.files.create({
+      file: fileStream,
+      purpose: "assistants"
+    });
+
+    console.log('File uploaded to OpenAI:', file.id);
+
+    // Update assistant with new file
+    if (assistantId) {
+      const currentAssistant = await openai.beta.assistants.retrieve(assistantId);
+      const currentFileIds = currentAssistant.tool_resources?.file_search?.vector_store_ids || [];
+      
+      // Create or update vector store
+      let vectorStoreId;
+      if (currentFileIds.length > 0) {
+        vectorStoreId = currentFileIds[0];
+        // Add file to existing vector store
+        await openai.beta.vectorStores.files.create(vectorStoreId, {
+          file_id: file.id
+        });
+      } else {
+        // Create new vector store
+        const vectorStore = await openai.beta.vectorStores.create({
+          name: "Course Materials",
+          file_ids: [file.id]
+        });
+        vectorStoreId = vectorStore.id;
+        
+        // Update assistant with vector store
+        await openai.beta.assistants.update(assistantId, {
+          tool_resources: {
+            file_search: {
+              vector_store_ids: [vectorStoreId]
+            }
+          }
+        });
+      }
+
+      console.log('Assistant updated with file');
+    }
+
+    // Clean up uploaded file
+    fs.unlinkSync(req.file.path);
+
+    res.json({ 
+      success: true, 
+      message: 'Course material uploaded successfully',
+      fileId: file.id,
+      filename: req.file.originalname
+    });
+
+  } catch (error) {
+    console.error('Upload error:', error);
+    
+    // Clean up file on error
+    if (req.file && req.file.path) {
+      try {
+        fs.unlinkSync(req.file.path);
+      } catch (unlinkError) {
+        console.error('Error cleaning up file:', unlinkError);
+      }
+    }
+    
+    res.status(500).json({ 
+      error: 'Failed to upload course material',
+      details: error.message 
+    });
+  }
+});
+
+// List uploaded files endpoint
+app.get('/course-files', async (req, res) => {
+  try {
+    if (!assistantId) {
+      return res.json({ files: [] });
+    }
+
+    const assistant = await openai.beta.assistants.retrieve(assistantId);
+    const vectorStoreIds = assistant.tool_resources?.file_search?.vector_store_ids || [];
+    
+    if (vectorStoreIds.length === 0) {
+      return res.json({ files: [] });
+    }
+
+    const files = await openai.beta.vectorStores.files.list(vectorStoreIds[0]);
+    const fileDetails = await Promise.all(
+      files.data.map(async (file) => {
+        const fileInfo = await openai.files.retrieve(file.id);
+        return {
+          id: file.id,
+          filename: fileInfo.filename,
+          size: fileInfo.bytes,
+          created_at: fileInfo.created_at
+        };
+      })
+    );
+
+    res.json({ files: fileDetails });
+  } catch (error) {
+    console.error('Error listing files:', error);
+    res.status(500).json({ error: 'Failed to list course files' });
   }
 });
 
