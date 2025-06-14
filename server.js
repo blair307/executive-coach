@@ -1,6 +1,8 @@
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
+const OpenAI = require('openai');
+
 const app = express();
 
 app.use(cors({
@@ -8,10 +10,75 @@ app.use(cors({
   methods: ['GET', 'POST'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
+
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+
+// Initialize OpenAI client
+const openai = new OpenAI({
+  apiKey: OPENAI_API_KEY,
+});
+
+// Store for user threads (in production, use a database)
+const userThreads = new Map();
+
+// Assistant ID - we'll create this automatically
+let assistantId = null;
+
+// Create assistant on startup
+async function createAssistant() {
+  try {
+    const assistant = await openai.beta.assistants.create({
+      name: "Entrepreneur Emotional Health Coach",
+      instructions: `You are a virtual personal strategic advisor and coach for EntrepreneurEmotionalHealth.com. You guide high-achieving entrepreneurs through major growth areas: Identity & Calling, Personal Relationships, and Whole-Life Development.
+
+You operate with deep psychological insight, system-level thinking, and a firm but compassionate tone. You help people break through self-sabotage, false identities, and emotional drift. You do not tolerate excuses, victim thinking, or surface-level quick fixes. You are direct, tough, strategic—and always rooting for their greatness.
+
+IMPORTANT: You are having a natural coaching conversation. Respond to what the person just said as you naturally would - with insight, challenges, follow-up questions, or observations. Be conversational, insightful, and responsive to their specific words and energy. Ask follow-up questions when appropriate. Challenge them when they need it. Celebrate breakthroughs when you sense them.
+
+When users are in structured question sequences (Identity & Calling or Personal Relationships), acknowledge their answers naturally but avoid asking follow-up questions since the next question is predetermined. Keep responses brief and encouraging during these sequences, but draw connections between their current answer and previous responses when relevant.`,
+      tools: [{ type: "file_search" }],
+      model: "gpt-4o-mini",
+    });
+    
+    assistantId = assistant.id;
+    console.log('Assistant created successfully:', assistantId);
+    return assistant.id;
+  } catch (error) {
+    console.error('Error creating assistant:', error);
+    throw error;
+  }
+}
+
+// Get or create thread for user
+async function getOrCreateThread(userId = 'default') {
+  if (userThreads.has(userId)) {
+    return userThreads.get(userId);
+  }
+  
+  try {
+    const thread = await openai.beta.threads.create();
+    userThreads.set(userId, thread.id);
+    return thread.id;
+  } catch (error) {
+    console.error('Error creating thread:', error);
+    throw error;
+  }
+}
+
+// Wait for run completion
+async function waitForCompletion(threadId, runId) {
+  let run = await openai.beta.threads.runs.retrieve(threadId, runId);
+  
+  while (run.status === 'queued' || run.status === 'in_progress') {
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    run = await openai.beta.threads.runs.retrieve(threadId, runId);
+  }
+  
+  return run;
+}
 
 app.post('/chat', async (req, res) => {
   try {
@@ -20,57 +87,52 @@ app.post('/chat', async (req, res) => {
     if (!message) {
       return res.status(400).json({ error: 'Message is required' });
     }
-    
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${OPENAI_API_KEY}`
-      },
-      body: JSON.stringify({
-        model: 'gpt-3.5-turbo',
-        messages: [
-          {
-            role: 'system',
-            content: `You are a virtual personal strategic advisor and coach for EntrepreneurEmotionalHealth.com. You guide high-achieving entrepreneurs through major growth areas: Identity & Calling, Personal Relationships, and Whole-Life Development.
 
-You operate with deep psychological insight, system-level thinking, and a firm but compassionate tone. You help people break through self-sabotage, false identities, and emotional drift. You do not tolerate excuses, victim thinking, or surface-level quick fixes. You are direct, tough, strategic—and always rooting for their greatness.
+    // Ensure assistant exists
+    if (!assistantId) {
+      await createAssistant();
+    }
 
-IMPORTANT: You are having a natural coaching conversation. Respond to what the person just said as you naturally would - with insight, challenges, follow-up questions, or observations. You can reference the context if helpful, but respond as if you're in a real coaching session.
+    // Get thread for this user (using IP as simple user ID)
+    const userId = req.ip || 'default';
+    const threadId = await getOrCreateThread(userId);
 
-Context: ${context || 'General conversation'}
-
-Be conversational, insightful, and responsive to their specific words and energy. Ask follow-up questions when appropriate. Challenge them when they need it. Celebrate breakthroughs when you sense them.`
-          },
-          {
-            role: 'user',
-            content: message
-          }
-        ],
-        max_tokens: 500,
-        temperature: 0.7
-      })
+    // Add user message to thread
+    await openai.beta.threads.messages.create(threadId, {
+      role: "user",
+      content: message
     });
 
-    const data = await response.json();
-    
-    // Better error handling
-    if (!response.ok) {
-      console.error('OpenAI API Error:', data);
-      return res.status(response.status).json({ 
-        error: data.error?.message || 'OpenAI API error' 
-      });
+    // Create run with additional instructions based on context
+    let additionalInstructions = '';
+    if (context && context.includes('Current path:')) {
+      additionalInstructions = `Context: ${context}`;
     }
-    
-    if (!data.choices || !data.choices[0] || !data.choices[0].message) {
-      console.error('Unexpected OpenAI response:', data);
-      return res.status(500).json({ 
-        error: 'Unexpected response from AI service' 
-      });
+
+    const run = await openai.beta.threads.runs.create(threadId, {
+      assistant_id: assistantId,
+      additional_instructions: additionalInstructions
+    });
+
+    // Wait for completion
+    const completedRun = await waitForCompletion(threadId, run.id);
+
+    if (completedRun.status === 'completed') {
+      // Get the assistant's response
+      const messages = await openai.beta.threads.messages.list(threadId);
+      const lastMessage = messages.data[0];
+      
+      if (lastMessage.role === 'assistant') {
+        const responseText = lastMessage.content[0].text.value;
+        res.json({ message: responseText });
+      } else {
+        throw new Error('No assistant response found');
+      }
+    } else {
+      console.error('Run failed:', completedRun.status, completedRun.last_error);
+      throw new Error(`Assistant run failed: ${completedRun.status}`);
     }
-    
-    res.json({ message: data.choices[0].message.content });
-    
+
   } catch (error) {
     console.error('Server Error:', error);
     res.status(500).json({ 
@@ -79,7 +141,29 @@ Be conversational, insightful, and responsive to their specific words and energy
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    assistant: assistantId ? 'ready' : 'not created',
+    timestamp: new Date().toISOString()
+  });
 });
+
+const PORT = process.env.PORT || 3000;
+
+// Initialize assistant and start server
+async function startServer() {
+  try {
+    await createAssistant();
+    app.listen(PORT, () => {
+      console.log(`Server running on port ${PORT}`);
+      console.log(`Assistant ID: ${assistantId}`);
+    });
+  } catch (error) {
+    console.error('Failed to start server:', error);
+    process.exit(1);
+  }
+}
+
+startServer();
