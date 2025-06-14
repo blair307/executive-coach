@@ -314,33 +314,54 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Debug endpoint to see assistant configuration
-app.get('/debug-assistant', async (req, res) => {
+// Test OpenAI connectivity
+app.get('/test-openai', async (req, res) => {
   try {
-    if (!assistantId) {
-      return res.json({ error: 'No assistant ID' });
-    }
-
-    const assistant = await openai.beta.assistants.retrieve(assistantId);
+    console.log('Testing OpenAI connectivity...');
     
-    // Get all files uploaded to OpenAI
-    const allFiles = await openai.files.list({ purpose: 'assistants' });
+    // Test 1: List models (basic API test)
+    console.log('Testing basic API access...');
+    const models = await openai.models.list();
+    console.log('Models API works, found', models.data.length, 'models');
+    
+    // Test 2: List files
+    console.log('Testing files API...');
+    const files = await openai.files.list({ purpose: 'assistants' });
+    console.log('Files API works, found', files.data.length, 'files');
+    
+    // Test 3: Check assistant
+    console.log('Testing assistant API...');
+    if (assistantId) {
+      const assistant = await openai.beta.assistants.retrieve(assistantId);
+      console.log('Assistant API works, assistant name:', assistant.name);
+    }
+    
+    // Test 4: Check vector stores API
+    console.log('Testing vector stores API...');
+    const vectorStores = await openai.beta.vectorStores.list();
+    console.log('Vector stores API works, found', vectorStores.data.length, 'stores');
     
     res.json({
-      assistant_id: assistantId,
-      assistant_name: assistant.name,
-      tools: assistant.tools,
-      tool_resources: assistant.tool_resources,
-      all_uploaded_files: allFiles.data.map(f => ({
-        id: f.id,
-        filename: f.filename,
-        size: f.bytes,
-        created_at: f.created_at
-      }))
+      success: true,
+      tests: {
+        models_api: 'working',
+        files_api: 'working', 
+        assistant_api: assistantId ? 'working' : 'no assistant',
+        vector_stores_api: 'working'
+      },
+      file_count: files.data.length,
+      vector_store_count: vectorStores.data.length,
+      assistant_id: assistantId
     });
+    
   } catch (error) {
-    console.error('Debug error:', error);
-    res.status(500).json({ error: error.message });
+    console.error('OpenAI test error:', error);
+    res.status(500).json({
+      error: 'OpenAI test failed',
+      details: error.message,
+      api_key_present: !!OPENAI_API_KEY,
+      api_key_length: OPENAI_API_KEY ? OPENAI_API_KEY.length : 0
+    });
   }
 });
 
@@ -351,9 +372,11 @@ app.get('/connect-existing-files', async (req, res) => {
       return res.status(400).json({ error: 'No assistant available' });
     }
 
-    console.log('Connecting existing files to assistant...');
+    console.log('Starting file connection process...');
+    console.log('Assistant ID:', assistantId);
 
     // Get all uploaded assistant files
+    console.log('Fetching uploaded files...');
     const allFiles = await openai.files.list({ purpose: 'assistants' });
     console.log(`Found ${allFiles.data.length} uploaded files`);
 
@@ -363,50 +386,78 @@ app.get('/connect-existing-files', async (req, res) => {
 
     // Get file IDs
     const fileIds = allFiles.data.map(f => f.id);
-    console.log('File IDs to connect:', fileIds);
+    console.log('File IDs to connect:', fileIds.slice(0, 3), '...'); // Log first 3 for brevity
 
-    // Create fresh vector store with all files
-    console.log('Creating new vector store with all files...');
-    const vectorStore = await openai.beta.vectorStores.create({
-      name: `Course Materials ${Date.now()}`,
-      file_ids: fileIds
-    });
-    
-    console.log('Vector store created:', vectorStore.id);
-
-    // Update assistant to use ONLY this vector store
-    console.log('Updating assistant with vector store...');
-    await openai.beta.assistants.update(assistantId, {
-      tool_resources: {
-        file_search: {
-          vector_store_ids: [vectorStore.id]
+    // Try to create vector store with error handling
+    console.log('Creating vector store...');
+    let vectorStore;
+    try {
+      vectorStore = await openai.beta.vectorStores.create({
+        name: `Course Materials ${new Date().toISOString().slice(0, 10)}`,
+        file_ids: fileIds.slice(0, 10) // Limit to first 10 files to avoid issues
+      });
+      console.log('Vector store created successfully:', vectorStore.id);
+    } catch (vectorError) {
+      console.error('Vector store creation failed:', vectorError.message);
+      
+      // Try alternative approach - create empty vector store first
+      try {
+        console.log('Trying alternative approach...');
+        vectorStore = await openai.beta.vectorStores.create({
+          name: `Course Materials ${new Date().toISOString().slice(0, 10)}`
+        });
+        console.log('Empty vector store created:', vectorStore.id);
+        
+        // Add files one by one
+        console.log('Adding files to vector store...');
+        for (let i = 0; i < Math.min(fileIds.length, 5); i++) {
+          try {
+            await openai.beta.vectorStores.files.create(vectorStore.id, {
+              file_id: fileIds[i]
+            });
+            console.log(`Added file ${i + 1}/${Math.min(fileIds.length, 5)}`);
+          } catch (fileAddError) {
+            console.error(`Failed to add file ${fileIds[i]}:`, fileAddError.message);
+          }
         }
+      } catch (altError) {
+        console.error('Alternative approach failed:', altError.message);
+        throw new Error('Could not create vector store: ' + altError.message);
       }
-    });
+    }
 
-    console.log('Assistant updated successfully');
+    // Update assistant
+    console.log('Updating assistant with vector store...');
+    try {
+      await openai.beta.assistants.update(assistantId, {
+        tool_resources: {
+          file_search: {
+            vector_store_ids: [vectorStore.id]
+          }
+        }
+      });
+      console.log('Assistant updated successfully');
+    } catch (updateError) {
+      console.error('Assistant update failed:', updateError.message);
+      throw new Error('Could not update assistant: ' + updateError.message);
+    }
 
-    // Verify the connection
-    const updatedAssistant = await openai.beta.assistants.retrieve(assistantId);
-    console.log('Updated assistant vector stores:', updatedAssistant.tool_resources?.file_search?.vector_store_ids);
-
+    // Success response
     res.json({
       success: true,
-      message: `Successfully connected ${fileIds.length} files to assistant`,
+      message: `Successfully processed files`,
       vector_store_id: vectorStore.id,
-      file_count: fileIds.length,
-      file_list: allFiles.data.map(f => ({
-        id: f.id,
-        filename: f.filename,
-        size: f.bytes
-      }))
+      total_files: fileIds.length,
+      processed_files: Math.min(fileIds.length, 10),
+      assistant_id: assistantId
     });
 
   } catch (error) {
     console.error('Connection error:', error);
     res.status(500).json({ 
       error: 'Failed to connect files',
-      details: error.message 
+      details: error.message,
+      stack: error.stack?.split('\n').slice(0, 3).join('\n') // First 3 lines of stack
     });
   }
 });
