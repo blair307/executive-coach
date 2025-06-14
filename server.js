@@ -264,7 +264,7 @@ app.post('/chat', async (req, res) => {
   }
 });
 
-// File upload endpoint - properly connects files to vector store
+// File upload endpoint - with proper error handling for both vector store and legacy modes
 app.post('/upload-course-material', upload.single('courseFile'), async (req, res) => {
   try {
     if (!req.file) {
@@ -273,9 +273,9 @@ app.post('/upload-course-material', upload.single('courseFile'), async (req, res
 
     console.log('Uploading file:', req.file.originalname);
 
-    // Ensure vector store exists
-    if (!vectorStoreId) {
-      console.log('No vector store, creating assistant first...');
+    // Ensure assistant exists
+    if (!assistantId) {
+      console.log('No assistant exists, creating one...');
       await createAssistant();
     }
 
@@ -288,12 +288,23 @@ app.post('/upload-course-material', upload.single('courseFile'), async (req, res
 
     console.log('File uploaded to OpenAI:', file.id);
 
-    // Add file to vector store (this is the key step that was missing!)
-    await openai.beta.vectorStores.files.create(vectorStoreId, {
-      file_id: file.id
-    });
-
-    console.log('File added to vector store:', vectorStoreId);
+    // Try to connect file based on available method
+    if (vectorStoreId && openai.beta?.vectorStores?.files) {
+      // Modern vector store approach
+      try {
+        await openai.beta.vectorStores.files.create(vectorStoreId, {
+          file_id: file.id
+        });
+        console.log('File added to vector store:', vectorStoreId);
+      } catch (vectorError) {
+        console.error('Failed to add to vector store:', vectorError.message);
+        // Fall back to legacy method
+        await connectFileLegacy(file.id);
+      }
+    } else {
+      // Legacy method
+      await connectFileLegacy(file.id);
+    }
 
     // Clean up uploaded file
     fs.unlinkSync(req.file.path);
@@ -303,7 +314,8 @@ app.post('/upload-course-material', upload.single('courseFile'), async (req, res
       message: 'File uploaded and connected successfully',
       fileId: file.id,
       filename: req.file.originalname,
-      vectorStoreId: vectorStoreId
+      vectorStoreId: vectorStoreId,
+      method: vectorStoreId ? 'vector_store' : 'legacy'
     });
 
   } catch (error) {
@@ -325,56 +337,83 @@ app.post('/upload-course-material', upload.single('courseFile'), async (req, res
   }
 });
 
-// List files endpoint - shows files actually connected to the assistant
+// Helper function for legacy file connection
+async function connectFileLegacy(fileId) {
+  try {
+    console.log('Using legacy file connection method...');
+    
+    // Get current assistant
+    const assistant = await openai.beta.assistants.retrieve(assistantId);
+    const currentFileIds = assistant.file_ids || [];
+    
+    // Add new file if not already present
+    if (!currentFileIds.includes(fileId)) {
+      const updatedFileIds = [...currentFileIds, fileId].slice(0, 20); // OpenAI limit
+      
+      await openai.beta.assistants.update(assistantId, {
+        file_ids: updatedFileIds,
+        tools: [{ type: "file_search" }]
+      });
+      
+      console.log('File connected using legacy method');
+    } else {
+      console.log('File already connected to assistant');
+    }
+  } catch (legacyError) {
+    console.error('Legacy connection failed:', legacyError.message);
+    throw legacyError;
+  }
+}
+
+// List files endpoint - handles both vector store and legacy modes
 app.get('/course-files', async (req, res) => {
   try {
-    if (!vectorStoreId) {
-      return res.json({ 
-        files: [],
-        message: 'No vector store created yet. Upload a file first.'
-      });
-    }
-
-    // Get files from vector store
-    const vectorStoreFiles = await openai.beta.vectorStores.files.list(vectorStoreId);
-    console.log(`Found ${vectorStoreFiles.data.length} files in vector store`);
+    let files = [];
     
-    if (vectorStoreFiles.data.length === 0) {
-      return res.json({ 
-        files: [],
-        message: 'No files connected to assistant yet.'
-      });
+    if (vectorStoreId && openai.beta?.vectorStores?.files) {
+      // Modern vector store approach
+      try {
+        const vectorStoreFiles = await openai.beta.vectorStores.files.list(vectorStoreId);
+        console.log(`Found ${vectorStoreFiles.data.length} files in vector store`);
+        
+        // Get detailed info for each file
+        files = await Promise.all(
+          vectorStoreFiles.data.map(async (vectorFile) => {
+            try {
+              const fileInfo = await openai.files.retrieve(vectorFile.id);
+              return {
+                id: vectorFile.id,
+                filename: fileInfo.filename || 'Unknown filename',
+                size: fileInfo.bytes || 0,
+                created_at: fileInfo.created_at,
+                status: vectorFile.status || 'connected'
+              };
+            } catch (fileError) {
+              console.error('Error retrieving file info for:', vectorFile.id);
+              return {
+                id: vectorFile.id,
+                filename: 'File info unavailable',
+                size: 0,
+                created_at: Date.now() / 1000,
+                status: 'error'
+              };
+            }
+          })
+        );
+      } catch (vectorError) {
+        console.error('Vector store files error:', vectorError.message);
+        // Fall back to legacy method
+        files = await getLegacyFiles();
+      }
+    } else {
+      // Legacy method
+      files = await getLegacyFiles();
     }
-
-    // Get detailed info for each file
-    const fileDetails = await Promise.all(
-      vectorStoreFiles.data.map(async (vectorFile) => {
-        try {
-          const fileInfo = await openai.files.retrieve(vectorFile.id);
-          return {
-            id: vectorFile.id,
-            filename: fileInfo.filename || 'Unknown filename',
-            size: fileInfo.bytes || 0,
-            created_at: fileInfo.created_at,
-            status: vectorFile.status || 'connected'
-          };
-        } catch (fileError) {
-          console.error('Error retrieving file info for:', vectorFile.id);
-          return {
-            id: vectorFile.id,
-            filename: 'File info unavailable',
-            size: 0,
-            created_at: Date.now() / 1000,
-            status: 'error'
-          };
-        }
-      })
-    );
 
     res.json({ 
-      files: fileDetails,
+      files: files,
       vectorStoreId: vectorStoreId,
-      message: `${fileDetails.length} files connected to assistant`
+      message: files.length > 0 ? `${files.length} files connected to assistant` : 'No files connected yet'
     });
 
   } catch (error) {
@@ -385,6 +424,52 @@ app.get('/course-files', async (req, res) => {
     });
   }
 });
+
+// Helper function to get files using legacy method
+async function getLegacyFiles() {
+  try {
+    if (!assistantId) {
+      return [];
+    }
+    
+    const assistant = await openai.beta.assistants.retrieve(assistantId);
+    const fileIds = assistant.file_ids || [];
+    
+    if (fileIds.length === 0) {
+      return [];
+    }
+    
+    // Get file details
+    const files = await Promise.all(
+      fileIds.map(async (fileId) => {
+        try {
+          const fileInfo = await openai.files.retrieve(fileId);
+          return {
+            id: fileId,
+            filename: fileInfo.filename || 'Unknown filename',
+            size: fileInfo.bytes || 0,
+            created_at: fileInfo.created_at,
+            status: 'connected'
+          };
+        } catch (fileError) {
+          console.error('Error retrieving legacy file info for:', fileId);
+          return {
+            id: fileId,
+            filename: 'File info unavailable',
+            size: 0,
+            created_at: Date.now() / 1000,
+            status: 'error'
+          };
+        }
+      })
+    );
+    
+    return files;
+  } catch (error) {
+    console.error('Legacy files error:', error);
+    return [];
+  }
+}
 
 // Connect existing files endpoint - with better error handling
 app.get('/connect-existing-files', async (req, res) => {
@@ -553,7 +638,8 @@ app.get('/debug-assistant', async (req, res) => {
       response.assistant_details = {
         name: assistant.name,
         tools: assistant.tools,
-        tool_resources: assistant.tool_resources
+        tool_resources: assistant.tool_resources,
+        file_ids: assistant.file_ids
       };
     }
 
