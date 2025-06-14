@@ -68,13 +68,26 @@ async function getOrCreateThread(userId = 'default') {
   }
 }
 
-// Wait for run completion
+// Wait for run completion with better error handling
 async function waitForCompletion(threadId, runId) {
   let run = await openai.beta.threads.runs.retrieve(threadId, runId);
+  let attempts = 0;
+  const maxAttempts = 30; // 30 seconds max
   
-  while (run.status === 'queued' || run.status === 'in_progress') {
+  while ((run.status === 'queued' || run.status === 'in_progress') && attempts < maxAttempts) {
     await new Promise(resolve => setTimeout(resolve, 1000));
     run = await openai.beta.threads.runs.retrieve(threadId, runId);
+    attempts++;
+  }
+  
+  if (attempts >= maxAttempts) {
+    console.error('Run timed out after 30 seconds');
+    throw new Error('Assistant response timed out');
+  }
+  
+  if (run.status === 'failed') {
+    console.error('Run failed:', run.last_error);
+    throw new Error(`Assistant run failed: ${run.last_error?.message || 'Unknown error'}`);
   }
   
   return run;
@@ -103,9 +116,12 @@ app.post('/chat', async (req, res) => {
       content: message
     });
 
-    // Create run with additional instructions based on context
+    // Create run with simplified context for structured sequences
     let additionalInstructions = '';
-    if (context && context.includes('Current path:')) {
+    if (context && context.includes('structured question sequence')) {
+      // For structured sequences, keep it simple
+      additionalInstructions = 'You are responding to an answer in a structured coaching sequence. Give a brief, encouraging response that acknowledges their answer and may reference previous responses for patterns, but do not ask follow-up questions.';
+    } else if (context && context.includes('Current path:')) {
       additionalInstructions = `Context: ${context}`;
     }
 
