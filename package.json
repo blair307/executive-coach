@@ -21,3 +21,11 @@
     "openai": "^4.0.0"
   }
 }
+{
+  "dependencies": {
+    "express": "^4.18.0",
+    "cors": "^2.8.5",
+    "openai": "^4.0.0",
+    "multer": "^1.4.5-lts.1"
+  }
+}
