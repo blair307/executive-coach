@@ -4,8 +4,23 @@ const path = require('path');
 const multer = require('multer');
 const fs = require('fs');
 
-// Import OpenAI - simplified approach
-const { OpenAI } = require('openai');
+// Import OpenAI - try multiple approaches for compatibility
+let OpenAI;
+try {
+  // Try modern import first
+  OpenAI = require('openai').OpenAI;
+  if (!OpenAI) {
+    // Fallback to default export
+    OpenAI = require('openai').default;
+  }
+  if (!OpenAI) {
+    // Fallback to direct require
+    OpenAI = require('openai');
+  }
+} catch (error) {
+  console.error('Failed to import OpenAI:', error);
+  process.exit(1);
+}
 
 const app = express();
 
@@ -28,17 +43,25 @@ const upload = multer({
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-// Initialize OpenAI client
+// Initialize OpenAI client with better error handling
 if (!OPENAI_API_KEY) {
   console.error('OPENAI_API_KEY environment variable is not set');
   process.exit(1);
 }
 
-const openai = new OpenAI({
-  apiKey: OPENAI_API_KEY,
-});
-
-console.log('OpenAI client initialized successfully');
+let openai;
+try {
+  openai = new OpenAI({
+    apiKey: OPENAI_API_KEY,
+  });
+  console.log('OpenAI client initialized successfully');
+  console.log('OpenAI client type:', typeof openai);
+  console.log('Beta available:', !!openai.beta);
+  console.log('VectorStores available:', !!openai.beta?.vectorStores);
+} catch (error) {
+  console.error('Failed to initialize OpenAI client:', error);
+  process.exit(1);
+}
 
 // Store for user threads and vector store
 const userThreads = new Map();
@@ -48,7 +71,17 @@ let vectorStoreId = null;
 // Create assistant with proper file search setup
 async function createAssistant() {
   try {
-    // First create a vector store for file storage
+    console.log('Creating assistant...');
+    console.log('Checking OpenAI beta API availability...');
+    
+    // Check if vector stores are available
+    if (!openai.beta || !openai.beta.vectorStores || !openai.beta.vectorStores.create) {
+      console.log('Vector stores not available, using legacy file approach...');
+      return await createLegacyAssistant();
+    }
+
+    // Try to create vector store
+    console.log('Creating vector store...');
     const vectorStore = await openai.beta.vectorStores.create({
       name: "Course Materials Vector Store"
     });
@@ -83,7 +116,39 @@ When users are in structured question sequences (Identity & Calling or Personal 
     
     return assistant.id;
   } catch (error) {
-    console.error('Error creating assistant:', error);
+    console.error('Error creating modern assistant:', error);
+    console.log('Falling back to legacy assistant creation...');
+    return await createLegacyAssistant();
+  }
+}
+
+// Fallback function for older API versions
+async function createLegacyAssistant() {
+  try {
+    console.log('Creating legacy assistant without vector store...');
+    
+    const assistant = await openai.beta.assistants.create({
+      name: "Entrepreneur Emotional Health Coach",
+      instructions: `You are a virtual personal strategic advisor and coach for EntrepreneurEmotionalHealth.com. You guide high-achieving entrepreneurs through major growth areas: Identity & Calling, Personal Relationships, and Whole-Life Development.
+
+You operate with deep psychological insight, system-level thinking, and a firm but compassionate tone. You help people break through self-sabotage, false identities, and emotional drift. You do not tolerate excuses, victim thinking, or surface-level quick fixes. You are direct, tough, strategic—and always rooting for their greatness.
+
+IMPORTANT: You have access to course materials and documents that have been uploaded to your knowledge base. When users ask questions, always search through these materials first to provide course-specific guidance. Reference the uploaded documents when relevant, and base your advice on the frameworks and content from the course materials.
+
+You are having a natural coaching conversation. Respond to what the person just said as you naturally would - with insight, challenges, follow-up questions, or observations. Be conversational, insightful, and responsive to their specific words and energy. Ask follow-up questions when appropriate. Challenge them when they need it. Celebrate breakthroughs when you sense them.
+
+When users are in structured question sequences (Identity & Calling or Personal Relationships), acknowledge their answers naturally but avoid asking follow-up questions since the next question is predetermined. Keep responses brief and encouraging during these sequences, but draw connections between their current answer and previous responses when relevant.`,
+      tools: [{ type: "file_search" }],
+      model: "gpt-4o-mini",
+    });
+    
+    assistantId = assistant.id;
+    vectorStoreId = null; // No vector store in legacy mode
+    console.log('Legacy assistant created successfully:', assistantId);
+    
+    return assistant.id;
+  } catch (error) {
+    console.error('Error creating legacy assistant:', error);
     throw error;
   }
 }
@@ -321,26 +386,48 @@ app.get('/course-files', async (req, res) => {
   }
 });
 
-// Connect existing files endpoint - for files uploaded before vector store was created
+// Connect existing files endpoint - with better error handling
 app.get('/connect-existing-files', async (req, res) => {
   try {
-    if (!assistantId || !vectorStoreId) {
+    console.log('=== Connect Existing Files Debug ===');
+    console.log('OpenAI client exists:', !!openai);
+    console.log('OpenAI beta exists:', !!openai?.beta);
+    console.log('VectorStores exists:', !!openai?.beta?.vectorStores);
+    console.log('Assistant ID:', assistantId);
+    console.log('Vector Store ID:', vectorStoreId);
+
+    // Ensure assistant exists
+    if (!assistantId) {
+      console.log('No assistant, creating one...');
       await createAssistant();
     }
 
-    console.log('Connecting existing files to vector store...');
-
     // Get all uploaded assistant files
+    console.log('Fetching uploaded files...');
     const allFiles = await openai.files.list({ purpose: 'assistants' });
     console.log(`Found ${allFiles.data.length} uploaded files`);
 
     if (allFiles.data.length === 0) {
       return res.json({ 
-        message: 'No files to connect', 
-        file_count: 0 
+        message: 'No files have been uploaded to OpenAI yet. Upload some files first.', 
+        file_count: 0,
+        debug: {
+          assistant_id: assistantId,
+          vector_store_id: vectorStoreId,
+          has_vector_stores: !!openai?.beta?.vectorStores
+        }
       });
     }
 
+    // If no vector store (legacy mode), try to attach files directly to assistant
+    if (!vectorStoreId) {
+      console.log('No vector store, using legacy file attachment...');
+      return await connectFilesLegacy(allFiles.data, res);
+    }
+
+    // Modern vector store approach
+    console.log('Using vector store approach...');
+    
     // Get files already in vector store to avoid duplicates
     const vectorStoreFiles = await openai.beta.vectorStores.files.list(vectorStoreId);
     const existingFileIds = new Set(vectorStoreFiles.data.map(f => f.id));
@@ -350,12 +437,13 @@ app.get('/connect-existing-files', async (req, res) => {
     
     if (filesToConnect.length === 0) {
       return res.json({ 
-        message: 'All files are already connected', 
-        file_count: existingFileIds.size 
+        message: 'All files are already connected to the vector store', 
+        file_count: existingFileIds.size,
+        vector_store_id: vectorStoreId
       });
     }
 
-    console.log(`Connecting ${filesToConnect.length} new files...`);
+    console.log(`Connecting ${filesToConnect.length} new files to vector store...`);
 
     // Connect each file to vector store
     const results = [];
@@ -365,9 +453,9 @@ app.get('/connect-existing-files', async (req, res) => {
           file_id: file.id
         });
         results.push({ id: file.id, filename: file.filename, status: 'connected' });
-        console.log(`Connected file: ${file.filename}`);
+        console.log(`✓ Connected file: ${file.filename}`);
       } catch (fileError) {
-        console.error(`Failed to connect file ${file.id}:`, fileError.message);
+        console.error(`✗ Failed to connect file ${file.id}:`, fileError.message);
         results.push({ id: file.id, filename: file.filename, status: 'failed', error: fileError.message });
       }
     }
@@ -376,20 +464,67 @@ app.get('/connect-existing-files', async (req, res) => {
 
     res.json({
       success: true,
-      message: `Connected ${successCount} of ${filesToConnect.length} files`,
+      message: `Connected ${successCount} of ${filesToConnect.length} files to vector store`,
       connected_count: successCount,
       total_files_now: existingFileIds.size + successCount,
+      vector_store_id: vectorStoreId,
       results: results
     });
 
   } catch (error) {
-    console.error('Connection error:', error);
+    console.error('=== Connection Error ===');
+    console.error('Error type:', error.name);
+    console.error('Error message:', error.message);
+    console.error('Full error:', error);
+    
     res.status(500).json({ 
       error: 'Failed to connect files',
-      details: error.message
+      details: error.message,
+      debug: {
+        assistant_id: assistantId,
+        vector_store_id: vectorStoreId,
+        has_openai: !!openai,
+        has_beta: !!openai?.beta,
+        has_vector_stores: !!openai?.beta?.vectorStores,
+        error_type: error.name
+      }
     });
   }
 });
+
+// Legacy file connection for older API versions
+async function connectFilesLegacy(files, res) {
+  try {
+    console.log('Attempting legacy file connection...');
+    
+    const fileIds = files.slice(0, 10).map(f => f.id); // Limit for legacy API
+    
+    // Try to update assistant with file_ids directly
+    await openai.beta.assistants.update(assistantId, {
+      file_ids: fileIds,
+      tools: [{ type: "file_search" }]
+    });
+    
+    console.log('Legacy file connection successful');
+    
+    return res.json({
+      success: true,
+      message: `Connected ${fileIds.length} files using legacy method`,
+      connected_count: fileIds.length,
+      method: 'legacy_file_ids',
+      file_ids: fileIds
+    });
+    
+  } catch (legacyError) {
+    console.error('Legacy connection also failed:', legacyError.message);
+    
+    return res.status(500).json({
+      error: 'Both modern and legacy file connection methods failed',
+      details: legacyError.message,
+      file_count: files.length
+    });
+  }
+}
 
 // Health check endpoint
 app.get('/health', (req, res) => {
@@ -406,7 +541,11 @@ app.get('/debug-assistant', async (req, res) => {
   try {
     const response = {
       assistant_id: assistantId,
-      vector_store_id: vectorStoreId
+      vector_store_id: vectorStoreId,
+      openai_available: !!openai,
+      beta_available: !!openai?.beta,
+      vector_stores_available: !!openai?.beta?.vectorStores,
+      assistants_available: !!openai?.beta?.assistants
     };
 
     if (assistantId) {
@@ -419,18 +558,84 @@ app.get('/debug-assistant', async (req, res) => {
     }
 
     if (vectorStoreId) {
-      const vectorStoreFiles = await openai.beta.vectorStores.files.list(vectorStoreId);
-      response.vector_store_files = vectorStoreFiles.data.length;
+      try {
+        const vectorStoreFiles = await openai.beta.vectorStores.files.list(vectorStoreId);
+        response.vector_store_files = vectorStoreFiles.data.length;
+      } catch (vsError) {
+        response.vector_store_error = vsError.message;
+      }
     }
 
     // Get all uploaded files
     const allFiles = await openai.files.list({ purpose: 'assistants' });
     response.all_uploaded_files = allFiles.data.length;
+    response.uploaded_files_list = allFiles.data.map(f => ({
+      id: f.id,
+      filename: f.filename,
+      size: f.bytes
+    }));
 
     res.json(response);
   } catch (error) {
     console.error('Debug error:', error);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ 
+      error: error.message,
+      debug: {
+        openai_exists: !!openai,
+        beta_exists: !!openai?.beta,
+        error_type: error.name
+      }
+    });
+  }
+});
+
+// Simple OpenAI test endpoint
+app.get('/test-openai', async (req, res) => {
+  try {
+    console.log('Testing OpenAI API...');
+    
+    // Test basic API access
+    const models = await openai.models.list();
+    console.log('✓ Models API working');
+    
+    // Test files API
+    const files = await openai.files.list({ purpose: 'assistants' });
+    console.log('✓ Files API working, found', files.data.length, 'files');
+    
+    // Test assistants API
+    let assistantTest = 'not tested';
+    if (openai.beta?.assistants) {
+      try {
+        if (assistantId) {
+          await openai.beta.assistants.retrieve(assistantId);
+          assistantTest = 'working';
+        } else {
+          assistantTest = 'no assistant created yet';
+        }
+      } catch (e) {
+        assistantTest = 'failed: ' + e.message;
+      }
+    } else {
+      assistantTest = 'beta API not available';
+    }
+    
+    res.json({
+      success: true,
+      models_api: 'working',
+      files_api: 'working',
+      files_count: files.data.length,
+      assistants_api: assistantTest,
+      vector_stores_api: openai.beta?.vectorStores ? 'available' : 'not available',
+      openai_version: 'unknown' // We can't easily get version from client
+    });
+    
+  } catch (error) {
+    res.status(500).json({
+      error: 'OpenAI test failed',
+      details: error.message,
+      has_openai: !!openai,
+      has_beta: !!openai?.beta
+    });
   }
 });
 
