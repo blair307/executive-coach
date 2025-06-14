@@ -345,7 +345,51 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Debug endpoint to see assistant configuration
+// Simple direct file attachment endpoint
+app.get('/force-attach-files', async (req, res) => {
+  try {
+    if (!assistantId) {
+      return res.status(400).json({ error: 'No assistant available' });
+    }
+
+    console.log('Force attaching files directly...');
+
+    // Get files
+    const allFiles = await openai.files.list({ purpose: 'assistants' });
+    const fileIds = allFiles.data.slice(0, 20).map(f => f.id); // OpenAI limit is 20 files
+
+    console.log(`Attempting to attach ${fileIds.length} files directly`);
+    console.log('File IDs:', fileIds);
+
+    // Simple direct update - just file_ids and tools
+    const updateResult = await openai.beta.assistants.update(assistantId, {
+      file_ids: fileIds,
+      tools: [{ type: "retrieval" }] // Use older retrieval tool name
+    });
+
+    console.log('Update successful');
+    console.log('Result file_ids length:', updateResult.file_ids?.length || 0);
+
+    // Verify immediately
+    const verifyAssistant = await openai.beta.assistants.retrieve(assistantId);
+    
+    res.json({
+      success: true,
+      message: `Force attached ${fileIds.length} files`,
+      attempted_files: fileIds.length,
+      actual_attached: verifyAssistant.file_ids?.length || 0,
+      file_ids_preview: verifyAssistant.file_ids?.slice(0, 3) || [],
+      tools: verifyAssistant.tools
+    });
+
+  } catch (error) {
+    console.error('Force attach error:', error);
+    res.status(500).json({
+      error: 'Force attach failed',
+      details: error.message
+    });
+  }
+});
 app.get('/debug-assistant', async (req, res) => {
   try {
     if (!assistantId) {
