@@ -1,9 +1,35 @@
 const express = require('express');
 const cors = require('cors');
+const mongoose = require('mongoose');
 const path = require('path');
 const multer = require('multer');
 const fs = require('fs');
 const crypto = require('crypto');
+
+const MONGODB_URI = 'mongodb+srv://blair:W1BRPfYM...mongodb+srv://blair:WlBRPfYM0jn6kdEg@cluster0.hcheocu.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0';
+
+// Connect to MongoDB
+mongoose.connect(MONGODB_URI)
+  .then(() => console.log('✅ Connected to MongoDB!'))
+  .catch(err => console.error('❌ MongoDB connection error:', err));
+
+// User storage design (like designing a filing folder)
+const userSchema = new mongoose.Schema({
+  id: String,
+  name: String,
+  email: String,
+  password: String,
+  planType: { type: String, default: 'free' },
+  isActive: { type: Boolean, default: false },
+  conversations: [{ 
+    message: String, 
+    response: String, 
+    timestamp: Date 
+  }],
+  createdAt: { type: Date, default: Date.now }
+});
+
+const User = mongoose.model('User', userSchema);
 
 // Import OpenAI - try multiple approaches for compatibility
 let OpenAI;
