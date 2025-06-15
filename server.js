@@ -67,7 +67,8 @@ try {
 // Store for user threads and vector store
 const userThreads = new Map();
 const userProfiles = new Map(); // Store user profile file IDs
-let assistantId = null;
+// Use your existing assistant instead of creating a new one
+let assistantId = 'asst_tpShoq1kPGvtcFhMdxb6EmYg'; // Your manually created assistant with files
 let vectorStoreId = null;
 
 // Generate unique user fingerprint
@@ -320,10 +321,8 @@ app.post('/chat', async (req, res) => {
     const userId = generateUserFingerprint(req);
     console.log('Processing message for user:', userId);
 
-    // Ensure assistant exists
-    if (!assistantId) {
-      await createAssistant();
-    }
+    // Your assistant already exists, no need to create it
+    console.log('Using existing assistant:', assistantId);
 
     // Get thread for this user
     const threadId = await getOrCreateThread(userId);
