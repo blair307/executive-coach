@@ -794,6 +794,80 @@ When users are in structured question sequences (Identity & Calling or Personal 
   }
 });
 
+// Detailed API capabilities test
+app.get('/test-api-capabilities', async (req, res) => {
+  try {
+    const capabilities = {
+      openai_client: typeof openai,
+      has_beta: !!openai.beta,
+      beta_keys: openai.beta ? Object.keys(openai.beta) : [],
+      has_assistants: !!openai.beta?.assistants,
+      assistants_methods: openai.beta?.assistants ? Object.keys(openai.beta.assistants) : [],
+      has_vectorStores: !!openai.beta?.vectorStores,
+      vectorStores_methods: openai.beta?.vectorStores ? Object.keys(openai.beta.vectorStores) : [],
+      has_threads: !!openai.beta?.threads,
+      openai_version: 'unknown'
+    };
+
+    // Test basic API access
+    try {
+      const models = await openai.models.list();
+      capabilities.models_working = true;
+      capabilities.models_count = models.data.length;
+    } catch (e) {
+      capabilities.models_working = false;
+      capabilities.models_error = e.message;
+    }
+
+    // Test files API
+    try {
+      const files = await openai.files.list({ purpose: 'assistants' });
+      capabilities.files_working = true;
+      capabilities.files_count = files.data.length;
+    } catch (e) {
+      capabilities.files_working = false;
+      capabilities.files_error = e.message;
+    }
+
+    // Test assistants API
+    try {
+      if (openai.beta?.assistants?.list) {
+        const assistants = await openai.beta.assistants.list();
+        capabilities.assistants_working = true;
+        capabilities.assistants_count = assistants.data.length;
+      } else {
+        capabilities.assistants_working = false;
+        capabilities.assistants_error = 'assistants.list method not available';
+      }
+    } catch (e) {
+      capabilities.assistants_working = false;
+      capabilities.assistants_error = e.message;
+    }
+
+    // Test vector stores API
+    try {
+      if (openai.beta?.vectorStores?.list) {
+        const vectorStores = await openai.beta.vectorStores.list();
+        capabilities.vectorStores_working = true;
+        capabilities.vectorStores_count = vectorStores.data.length;
+      } else {
+        capabilities.vectorStores_working = false;
+        capabilities.vectorStores_error = 'vectorStores.list method not available';
+      }
+    } catch (e) {
+      capabilities.vectorStores_working = false;
+      capabilities.vectorStores_error = e.message;
+    }
+
+    res.json(capabilities);
+  } catch (error) {
+    res.status(500).json({
+      error: 'API capabilities test failed',
+      details: error.message
+    });
+  }
+});
+
 // Simple OpenAI test endpoint
 app.get('/test-openai', async (req, res) => {
   try {
