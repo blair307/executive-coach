@@ -5,6 +5,8 @@ const path = require('path');
 const multer = require('multer');
 const fs = require('fs');
 const crypto = require('crypto');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
 
 const MONGODB_URI = 'mongodb+srv://blair:G00dgvnr%211234567@cluster0.hcheocu.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0';
 
@@ -97,14 +99,34 @@ const userProfiles = new Map(); // Store user profile file IDs
 let assistantId = 'asst_tpShoq1kPGvtcFhMdxb6EmYg'; // Your manually created assistant with files
 let vectorStoreId = null;
 
+// JWT Secret
+const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
+
+// Valid coupon codes
+const VALID_COUPONS = {
+  'KAJABI2025': { discount: 100, type: 'percent', description: 'Course Student Access' },
+  'COURSE2025': { discount: 100, type: 'percent', description: 'Course Student Access' },
+  'STUDENT50': { discount: 50, type: 'percent', description: '50% Student Discount' }
+};
+
 // Generate unique user fingerprint
-function generateUserFingerprint(req) {
+function generateUserFingerprint(req, userEmail) {
+  // Use email-based fingerprint for logged-in users
+  if (userEmail) {
+    const hash = crypto
+      .createHash('md5')
+      .update(userEmail)
+      .digest('hex')
+      .substring(0, 12);
+    return `user_${hash}`;
+  }
+  
+  // Fallback to browser fingerprint for anonymous users
   const userAgent = req.headers['user-agent'] || '';
   const acceptLanguage = req.headers['accept-language'] || '';
   const acceptEncoding = req.headers['accept-encoding'] || '';
   const ip = req.ip || req.connection.remoteAddress || '';
   
-  // Create a hash from browser characteristics + IP
   const fingerprint = crypto
     .createHash('md5')
     .update(userAgent + acceptLanguage + acceptEncoding + ip)
@@ -112,6 +134,24 @@ function generateUserFingerprint(req) {
     .substring(0, 12);
   
   return `user_${fingerprint}`;
+}
+
+// Middleware to verify JWT token
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) {
+    return res.status(401).json({ error: 'Access token required' });
+  }
+
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) {
+      return res.status(403).json({ error: 'Invalid or expired token' });
+    }
+    req.user = user;
+    next();
+  });
 }
 
 // Save user conversation summary to file
@@ -334,7 +374,250 @@ async function waitForCompletion(threadId, runId) {
   return run;
 }
 
-// Enhanced chat endpoint with memory
+// AUTHENTICATION ENDPOINTS
+
+// Validate coupon endpoint
+app.post('/validate-coupon', async (req, res) => {
+  try {
+    const { couponCode } = req.body;
+    
+    if (!couponCode) {
+      return res.status(400).json({ error: 'Coupon code required' });
+    }
+    
+    const coupon = VALID_COUPONS[couponCode.toUpperCase()];
+    
+    if (coupon) {
+      res.json({
+        valid: true,
+        discount: coupon.discount,
+        type: coupon.type,
+        description: coupon.description
+      });
+    } else {
+      res.json({
+        valid: false,
+        message: 'Invalid coupon code'
+      });
+    }
+  } catch (error) {
+    console.error('Coupon validation error:', error);
+    res.status(500).json({ error: 'Failed to validate coupon' });
+  }
+});
+
+// User registration endpoint - CLEAN MONGODB VERSION
+app.post('/register', async (req, res) => {
+  try {
+    const { name, email, password, planType, price, couponCode } = req.body;
+    
+    // Validate required fields
+    if (!name || !email || !password) {
+      return res.status(400).json({ error: 'Name, email, and password are required' });
+    }
+    
+    // Check if user already exists
+    const existingUser = await User.findOne({ email: email.toLowerCase() });
+    if (existingUser) {
+      return res.status(400).json({ error: 'User already exists with this email' });
+    }
+    
+    // Hash password
+    const saltRounds = 10;
+    const hashedPassword = await bcrypt.hash(password, saltRounds);
+    
+    // Create user object
+    const userData = {
+      id: crypto.randomUUID(),
+      name: name.trim(),
+      email: email.toLowerCase().trim(),
+      password: hashedPassword,
+      planType: planType || 'monthly',
+      price: price || 47,
+      couponCode: couponCode || null,
+      createdAt: new Date().toISOString(),
+      isActive: planType === 'free' ? true : false, // Free users active immediately
+      lastLogin: null,
+      chatFingerprint: generateUserFingerprint(req, email)
+    };
+    
+    // Store user in MongoDB
+    const newUser = new User(userData);
+    await newUser.save();
+    
+    // Generate JWT token
+    const token = jwt.sign(
+      { 
+        userId: userData.id, 
+        email: userData.email,
+        fingerprint: userData.chatFingerprint
+      }, 
+      JWT_SECRET, 
+      { expiresIn: '30d' }
+    );
+    
+    // Return user data (without password)
+    const { password: _, ...userWithoutPassword } = userData;
+    
+    console.log(`New user registered: ${email} with plan: ${planType}`);
+    
+    res.json({
+      message: 'User registered successfully',
+      user: userWithoutPassword,
+      token: token,
+      requiresPayment: planType !== 'free'
+    });
+  } catch (error) {
+    console.error('Registration error:', error);
+    res.status(500).json({ error: 'Failed to register user' });
+  }
+});
+
+// User login endpoint
+app.post('/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+    
+    // Find user
+    const user = await User.findOne({ email: email.toLowerCase() });
+    
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+    
+    // Verify password
+    const passwordMatch = await bcrypt.compare(password, user.password);
+    
+    if (!passwordMatch) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+    
+    // Check if account is active (for paid plans)
+    if (!user.isActive && user.planType !== 'free') {
+      return res.status(403).json({ 
+        error: 'Account inactive. Please complete payment to access your coaching dashboard.',
+        requiresPayment: true,
+        planType: user.planType
+      });
+    }
+    
+    // Update last login
+    user.lastLogin = new Date().toISOString();
+    await user.save();
+    
+    // Generate JWT token
+    const token = jwt.sign(
+      { 
+        userId: user.id, 
+        email: user.email,
+        fingerprint: user.chatFingerprint
+      }, 
+      JWT_SECRET, 
+      { expiresIn: '30d' }
+    );
+    
+    // Return user data (without password)
+    const { password: _, ...userWithoutPassword } = user.toObject();
+    
+    console.log(`User logged in: ${email}`);
+    
+    res.json({
+      message: 'Login successful',
+      user: userWithoutPassword,
+      token: token
+    });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ error: 'Failed to login' });
+  }
+});
+
+// Get user profile endpoint
+app.get('/profile', authenticateToken, async (req, res) => {
+  try {
+    const user = await User.findOne({ email: req.user.email });
+    
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    // Return user data (without password)
+    const { password: _, ...userWithoutPassword } = user.toObject();
+    
+    res.json({
+      user: userWithoutPassword
+    });
+  } catch (error) {
+    console.error('Profile error:', error);
+    res.status(500).json({ error: 'Failed to get profile' });
+  }
+});
+
+// Update user profile endpoint
+app.put('/profile', authenticateToken, async (req, res) => {
+  try {
+    const { name, preferences } = req.body;
+    const user = await User.findOne({ email: req.user.email });
+    
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    // Update user data
+    if (name) user.name = name.trim();
+    if (preferences) user.preferences = preferences;
+    user.updatedAt = new Date().toISOString();
+    
+    await user.save();
+    
+    // Return updated user data (without password)
+    const { password: _, ...userWithoutPassword } = user.toObject();
+    
+    res.json({
+      message: 'Profile updated successfully',
+      user: userWithoutPassword
+    });
+  } catch (error) {
+    console.error('Profile update error:', error);
+    res.status(500).json({ error: 'Failed to update profile' });
+  }
+});
+
+// Activate account endpoint (for after payment)
+app.post('/activate-account', async (req, res) => {
+  try {
+    const { email, paymentId } = req.body;
+    
+    const user = await User.findOne({ email: email.toLowerCase() });
+    
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    // Activate account
+    user.isActive = true;
+    user.paymentId = paymentId;
+    user.activatedAt = new Date().toISOString();
+    
+    await user.save();
+    
+    console.log(`Account activated for: ${email}`);
+    
+    res.json({
+      message: 'Account activated successfully',
+      user: { ...user.toObject(), password: undefined }
+    });
+  } catch (error) {
+    console.error('Account activation error:', error);
+    res.status(500).json({ error: 'Failed to activate account' });
+  }
+});
+
+// Enhanced chat endpoint with authentication
 app.post('/chat', async (req, res) => {
   try {
     const { message, context } = req.body;
@@ -343,9 +626,27 @@ app.post('/chat', async (req, res) => {
       return res.status(400).json({ error: 'Message is required' });
     }
 
-    // Generate user fingerprint
-    const userId = generateUserFingerprint(req);
-    console.log('Processing message for user:', userId);
+    // Check if user is authenticated
+    const authHeader = req.headers['authorization'];
+    let userId;
+    let userEmail = null;
+    
+    if (authHeader) {
+      try {
+        const token = authHeader.split(' ')[1];
+        const decoded = jwt.verify(token, JWT_SECRET);
+        userId = decoded.fingerprint; // Use the stored fingerprint
+        userEmail = decoded.email;
+        console.log(`Authenticated chat for user: ${userEmail}`);
+      } catch (tokenError) {
+        console.log('Invalid token, using anonymous chat');
+        userId = generateUserFingerprint(req);
+      }
+    } else {
+      // Anonymous user
+      userId = generateUserFingerprint(req);
+      console.log(`Anonymous chat for user: ${userId}`);
+    }
 
     // Your assistant already exists, no need to create it
     console.log('Using existing assistant:', assistantId);
@@ -361,12 +662,18 @@ app.post('/chat', async (req, res) => {
 
     // Create run with proper instructions that include user memory search
     let additionalInstructions = '';
-    if (context && context.includes('structured question sequence')) {
-      additionalInstructions = `User ID: ${userId} - You are responding to an answer in a structured coaching sequence. Give a brief, encouraging response that acknowledges their answer and may reference previous responses for patterns, but do not ask follow-up questions. Search your attached files for relevant course material AND any user profile for user ${userId} to maintain continuity.`;
-    } else if (context && context.includes('Current path:')) {
-      additionalInstructions = `User ID: ${userId} - ${context}. Always search through your attached course files and reference relevant content when applicable. ALSO search for user profile ${userId} to maintain conversation continuity.`;
+    if (userEmail) {
+      additionalInstructions = `Authenticated User: ${userEmail} (ID: ${userId}) - `;
     } else {
-      additionalInstructions = `User ID: ${userId} - Search through your attached course files and reference relevant content from the uploaded materials when responding to the user's question. MOST IMPORTANTLY: Search for and reference the user profile file for ${userId} to maintain conversation continuity and build on past insights. If you find their profile, acknowledge previous work and connect it to current conversation.`;
+      additionalInstructions = `Anonymous User (ID: ${userId}) - `;
+    }
+    
+    if (context && context.includes('structured question sequence')) {
+      additionalInstructions += `You are responding to an answer in a structured coaching sequence. Give a brief, encouraging response that acknowledges their answer and may reference previous responses for patterns, but do not ask follow-up questions. Search your attached files for relevant course material AND any user profile for user ${userId} to maintain continuity.`;
+    } else if (context && context.includes('Current path:')) {
+      additionalInstructions += `${context}. Always search through your attached course files and reference relevant content when applicable. ALSO search for user profile ${userId} to maintain conversation continuity.`;
+    } else {
+      additionalInstructions += `Search through your attached course files and reference relevant content from the uploaded materials when responding to the user's question. MOST IMPORTANTLY: Search for and reference the user profile file for ${userId} to maintain conversation continuity and build on past insights. If you find their profile, acknowledge previous work and connect it to current conversation.`;
     }
 
     const run = await openai.beta.threads.runs.create(threadId, {
@@ -386,7 +693,8 @@ app.post('/chat', async (req, res) => {
         const responseText = lastMessage.content[0].text.value;
         res.json({ 
           message: responseText,
-          userId: userId // Send back for frontend reference
+          userId: userId,
+          authenticated: !!userEmail
         });
       } else {
         throw new Error('No assistant response found');
@@ -710,324 +1018,7 @@ app.get('/debug-assistant', async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 3000;
-
-// Start server
-async function startServer() {
-  try {
-    app.listen(PORT, () => {
-      console.log(`Server running on port ${PORT}`);
-      console.log('Ready to create assistant and vector store when needed');
-    });
-  } catch (error) {
-    console.error('Failed to start server:', error);
-    process.exit(1);
-  }
-}
-// ADD THESE TO YOUR EXISTING SERVER.JS FILE
-// Add these imports at the top (after your existing imports)
-const bcrypt = require('bcrypt');
-const jwt = require('jsonwebtoken');
-
-// Add these after your existing middleware
-const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
-
-// Valid coupon codes
-const VALID_COUPONS = {
-  'KAJABI2025': { discount: 100, type: 'percent', description: 'Course Student Access' },
-  'COURSE2025': { discount: 100, type: 'percent', description: 'Course Student Access' },
-  'STUDENT50': { discount: 50, type: 'percent', description: '50% Student Discount' }
-};
-
-// Middleware to verify JWT token
-function authenticateToken(req, res, next) {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
-
-  if (!token) {
-    return res.status(401).json({ error: 'Access token required' });
-  }
-
-  jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) {
-      return res.status(403).json({ error: 'Invalid or expired token' });
-    }
-    req.user = user;
-    next();
-  });
-}
-
-// Helper function to generate user fingerprint (for existing chat system)
-function generateUserFingerprint(req, userEmail) {
-  // Use email-based fingerprint for logged-in users
-  if (userEmail) {
-    const hash = crypto
-      .createHash('md5')
-      .update(userEmail)
-      .digest('hex')
-      .substring(0, 12);
-    return `user_${hash}`;
-  }
-  
-  // Fallback to browser fingerprint for anonymous users
-  const userAgent = req.headers['user-agent'] || '';
-  const acceptLanguage = req.headers['accept-language'] || '';
-  const acceptEncoding = req.headers['accept-encoding'] || '';
-  const ip = req.ip || req.connection.remoteAddress || '';
-  
-  const fingerprint = crypto
-    .createHash('md5')
-    .update(userAgent + acceptLanguage + acceptEncoding + ip)
-    .digest('hex')
-    .substring(0, 12);
-  
-  return `user_${fingerprint}`;
-}
-
-// AUTHENTICATION ENDPOINTS
-
-// Validate coupon endpoint
-app.post('/validate-coupon', async (req, res) => {
-  try {
-    const { couponCode } = req.body;
-    
-    if (!couponCode) {
-      return res.status(400).json({ error: 'Coupon code required' });
-    }
-    
-    const coupon = VALID_COUPONS[couponCode.toUpperCase()];
-    
-    if (coupon) {
-      res.json({
-        valid: true,
-        discount: coupon.discount,
-        type: coupon.type,
-        description: coupon.description
-      });
-    } else {
-      res.json({
-        valid: false,
-        message: 'Invalid coupon code'
-      });
-    }
-  } catch (error) {
-    console.error('Coupon validation error:', error);
-    res.status(500).json({ error: 'Failed to validate coupon' });
-  }
-});
-
-// User registration endpoint - FIXED VERSION
-app.post('/register', async (req, res) => {
-  try {
-    const { name, email, password, planType, price, couponCode } = req.body;
-    
-    // Validate required fields
-    if (!name || !email || !password) {
-      return res.status(400).json({ error: 'Name, email, and password are required' });
-    }
-    
-    // Check if user already exists - FIXED
-    const existingUser = await User.findOne({ email: email.toLowerCase() });
-    if (existingUser) {
-      return res.status(400).json({ error: 'User already exists with this email' });
-    }
-    
-    // Hash password
-    const saltRounds = 10;
-    const hashedPassword = await bcrypt.hash(password, saltRounds);
-    
-    // Create user object
-    const userData = {
-      id: crypto.randomUUID(),
-      name: name.trim(),
-      email: email.toLowerCase().trim(),
-      password: hashedPassword,
-      planType: planType || 'monthly',
-      price: price || 47,
-      couponCode: couponCode || null,
-      createdAt: new Date().toISOString(),
-      isActive: planType === 'free' ? true : false, // Free users active immediately
-      lastLogin: null,
-      chatFingerprint: generateUserFingerprint(req, email)
-    };
-    
-    // Store user - FIXED
-    const newUser = new User(userData);
-    await newUser.save();
-    
-    // Generate JWT token
-    const token = jwt.sign(
-      { 
-        userId: userData.id, 
-        email: userData.email,
-        fingerprint: userData.chatFingerprint
-      }, 
-      JWT_SECRET, 
-      { expiresIn: '30d' }
-    );
-    
-    // Return user data (without password)
-    const { password: _, ...userWithoutPassword } = userData;
-    
-    console.log(`New user registered: ${email} with plan: ${planType}`);
-    
-    res.json({
-      message: 'User registered successfully',
-      user: userWithoutPassword,
-      token: token,
-      requiresPayment: planType !== 'free'
-    });
-  } catch (error) {
-    console.error('Registration error:', error);
-    res.status(500).json({ error: 'Failed to register user' });
-  }
-});
-
-// User login endpoint - FIXED VERSION  
-app.post('/login', async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Email and password are required' });
-    }
-    
-    // Find user - ALREADY FIXED
-    const user = await User.findOne({ email: email.toLowerCase() });
-    
-    if (!user) {
-      return res.status(401).json({ error: 'Invalid email or password' });
-    }
-    
-    // Verify password
-    const passwordMatch = await bcrypt.compare(password, user.password);
-    
-    if (!passwordMatch) {
-      return res.status(401).json({ error: 'Invalid email or password' });
-    }
-    
-    // Check if account is active (for paid plans)
-    if (!user.isActive && user.planType !== 'free') {
-      return res.status(403).json({ 
-        error: 'Account inactive. Please complete payment to access your coaching dashboard.',
-        requiresPayment: true,
-        planType: user.planType
-      });
-    }
-    
-    // Update last login - FIXED
-    user.lastLogin = new Date().toISOString();
-    await user.save();
-    
-    // Generate JWT token
-    const token = jwt.sign(
-      { 
-        userId: user.id, 
-        email: user.email,
-        fingerprint: user.chatFingerprint
-      }, 
-      JWT_SECRET, 
-      { expiresIn: '30d' }
-    );
-    
-    // Return user data (without password)
-    const { password: _, ...userWithoutPassword } = user.toObject();
-    
-    console.log(`User logged in: ${email}`);
-    
-    res.json({
-      message: 'Login successful',
-      user: userWithoutPassword,
-      token: token
-    });
-  } catch (error) {
-    console.error('Login error:', error);
-    res.status(500).json({ error: 'Failed to login' });
-  }
-});
-
-// Get user profile endpoint - FIXED VERSION
-app.get('/profile', authenticateToken, async (req, res) => {
-  try {
-    const user = await User.findOne({ email: req.user.email });
-    
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-    
-    // Return user data (without password)
-    const { password: _, ...userWithoutPassword } = user.toObject();
-    
-    res.json({
-      user: userWithoutPassword
-    });
-  } catch (error) {
-    console.error('Profile error:', error);
-    res.status(500).json({ error: 'Failed to get profile' });
-  }
-});
-
-// Update user profile endpoint - FIXED VERSION
-app.put('/profile', authenticateToken, async (req, res) => {
-  try {
-    const { name, preferences } = req.body;
-    const user = await User.findOne({ email: req.user.email });
-    
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-    
-    // Update user data
-    if (name) user.name = name.trim();
-    if (preferences) user.preferences = preferences;
-    user.updatedAt = new Date().toISOString();
-    
-    await user.save();
-    
-    // Return updated user data (without password)
-    const { password: _, ...userWithoutPassword } = user.toObject();
-    
-    res.json({
-      message: 'Profile updated successfully',
-      user: userWithoutPassword
-    });
-  } catch (error) {
-    console.error('Profile update error:', error);
-    res.status(500).json({ error: 'Failed to update profile' });
-  }
-});
-
-// Activate account endpoint - FIXED VERSION
-app.post('/activate-account', async (req, res) => {
-  try {
-    const { email, paymentId } = req.body;
-    
-    const user = await User.findOne({ email: email.toLowerCase() });
-    
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-    
-    // Activate account
-    user.isActive = true;
-    user.paymentId = paymentId;
-    user.activatedAt = new Date().toISOString();
-    
-    await user.save();
-    
-    console.log(`Account activated for: ${email}`);
-    
-    res.json({
-      message: 'Account activated successfully',
-      user: { ...user.toObject(), password: undefined }
-    });
-  } catch (error) {
-    console.error('Account activation error:', error);
-    res.status(500).json({ error: 'Failed to activate account' });
-  }
-});
-
-// Debug endpoint - FIXED VERSION
+// Debug endpoint to list users
 app.get('/debug-users', async (req, res) => {
   try {
     const users = await User.find({}, { password: 0 }); // Exclude passwords
@@ -1042,3 +1033,22 @@ app.get('/debug-users', async (req, res) => {
     res.status(500).json({ error: 'Failed to get users' });
   }
 });
+
+const PORT = process.env.PORT || 3000;
+
+// Start server
+async function startServer() {
+  try {
+    app.listen(PORT, () => {
+      console.log(`Server running on port ${PORT}`);
+      console.log('Authentication system initialized');
+      console.log('Valid coupon codes:', Object.keys(VALID_COUPONS));
+      console.log('Ready to create assistant and vector store when needed');
+    });
+  } catch (error) {
+    console.error('Failed to start server:', error);
+    process.exit(1);
+  }
+}
+
+startServer();
