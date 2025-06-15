@@ -675,6 +675,82 @@ app.get('/debug-assistant', async (req, res) => {
   }
 });
 
+// Reset assistant endpoint - recreates assistant with proper file connections
+app.get('/reset-assistant', async (req, res) => {
+  try {
+    console.log('=== RESETTING ASSISTANT ===');
+    
+    // Delete current assistant if it exists
+    if (assistantId) {
+      try {
+        await openai.beta.assistants.del(assistantId);
+        console.log('Deleted old assistant:', assistantId);
+      } catch (deleteError) {
+        console.log('Could not delete old assistant (might not exist):', deleteError.message);
+      }
+    }
+    
+    // Reset global variables
+    assistantId = null;
+    vectorStoreId = null;
+    
+    // Get all uploaded files
+    const allFiles = await openai.files.list({ purpose: 'assistants' });
+    console.log(`Found ${allFiles.data.length} uploaded files to attach`);
+    
+    if (allFiles.data.length === 0) {
+      return res.json({
+        success: true,
+        message: 'Assistant reset, but no files to attach. Upload some files first.',
+        assistant_id: null
+      });
+    }
+    
+    // Take first 20 files (OpenAI limit)
+    const fileIds = allFiles.data.slice(0, 20).map(f => f.id);
+    console.log(`Will attach ${fileIds.length} files to new assistant`);
+    
+    // Create new assistant with files attached directly
+    const assistant = await openai.beta.assistants.create({
+      name: "Entrepreneur Emotional Health Coach",
+      instructions: `You are a virtual personal strategic advisor and coach for EntrepreneurEmotionalHealth.com. You guide high-achieving entrepreneurs through major growth areas: Identity & Calling, Personal Relationships, and Whole-Life Development.
+
+You operate with deep psychological insight, system-level thinking, and a firm but compassionate tone. You help people break through self-sabotage, false identities, and emotional drift. You do not tolerate excuses, victim thinking, or surface-level quick fixes. You are direct, tough, strategic—and always rooting for their greatness.
+
+IMPORTANT: You have access to course materials and documents that have been uploaded to your knowledge base. When users ask questions, always search through these materials first to provide course-specific guidance. Reference the uploaded documents when relevant, and base your advice on the frameworks and content from the course materials.
+
+You are having a natural coaching conversation. Respond to what the person just said as you naturally would - with insight, challenges, follow-up questions, or observations. Be conversational, insightful, and responsive to their specific words and energy. Ask follow-up questions when appropriate. Challenge them when they need it. Celebrate breakthroughs when you sense them.
+
+When users are in structured question sequences (Identity & Calling or Personal Relationships), acknowledge their answers naturally but avoid asking follow-up questions since the next question is predetermined. Keep responses brief and encouraging during these sequences, but draw connections between their current answer and previous responses when relevant.`,
+      tools: [{ type: "file_search" }],
+      file_ids: fileIds, // Direct file attachment
+      model: "gpt-4o-mini",
+    });
+    
+    assistantId = assistant.id;
+    console.log('New assistant created successfully:', assistantId);
+    console.log('Files attached:', assistant.file_ids?.length || 0);
+    
+    // Verify the files are attached
+    const verifyAssistant = await openai.beta.assistants.retrieve(assistantId);
+    
+    res.json({
+      success: true,
+      message: `Assistant recreated successfully with ${verifyAssistant.file_ids?.length || 0} files attached`,
+      assistant_id: assistantId,
+      attached_files: verifyAssistant.file_ids?.length || 0,
+      method: 'direct_file_ids'
+    });
+    
+  } catch (error) {
+    console.error('Reset assistant error:', error);
+    res.status(500).json({
+      error: 'Failed to reset assistant',
+      details: error.message
+    });
+  }
+});
+
 // Simple OpenAI test endpoint
 app.get('/test-openai', async (req, res) => {
   try {
