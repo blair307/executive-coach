@@ -816,7 +816,7 @@ app.post('/validate-coupon', async (req, res) => {
   }
 });
 
-// User registration endpoint
+// User registration endpoint - FIXED VERSION
 app.post('/register', async (req, res) => {
   try {
     const { name, email, password, planType, price, couponCode } = req.body;
@@ -826,8 +826,9 @@ app.post('/register', async (req, res) => {
       return res.status(400).json({ error: 'Name, email, and password are required' });
     }
     
-    // Check if user already exists
-    if (users.has(email.toLowerCase())) {
+    // Check if user already exists - FIXED
+    const existingUser = await User.findOne({ email: email.toLowerCase() });
+    if (existingUser) {
       return res.status(400).json({ error: 'User already exists with this email' });
     }
     
@@ -836,7 +837,7 @@ app.post('/register', async (req, res) => {
     const hashedPassword = await bcrypt.hash(password, saltRounds);
     
     // Create user object
-    const user = {
+    const userData = {
       id: crypto.randomUUID(),
       name: name.trim(),
       email: email.toLowerCase().trim(),
@@ -850,23 +851,23 @@ app.post('/register', async (req, res) => {
       chatFingerprint: generateUserFingerprint(req, email)
     };
     
-    // Store user
-const newUser = new User(user);
-await newUser.save();
+    // Store user - FIXED
+    const newUser = new User(userData);
+    await newUser.save();
     
     // Generate JWT token
     const token = jwt.sign(
       { 
-        userId: user.id, 
-        email: user.email,
-        fingerprint: user.chatFingerprint
+        userId: userData.id, 
+        email: userData.email,
+        fingerprint: userData.chatFingerprint
       }, 
       JWT_SECRET, 
       { expiresIn: '30d' }
     );
     
     // Return user data (without password)
-    const { password: _, ...userWithoutPassword } = user;
+    const { password: _, ...userWithoutPassword } = userData;
     
     console.log(`New user registered: ${email} with plan: ${planType}`);
     
@@ -882,7 +883,7 @@ await newUser.save();
   }
 });
 
-// User login endpoint
+// User login endpoint - FIXED VERSION  
 app.post('/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -891,8 +892,8 @@ app.post('/login', async (req, res) => {
       return res.status(400).json({ error: 'Email and password are required' });
     }
     
-    // Find user
-const user = await User.findOne({ email: email.toLowerCase() });
+    // Find user - ALREADY FIXED
+    const user = await User.findOne({ email: email.toLowerCase() });
     
     if (!user) {
       return res.status(401).json({ error: 'Invalid email or password' });
@@ -914,9 +915,9 @@ const user = await User.findOne({ email: email.toLowerCase() });
       });
     }
     
-    // Update last login
+    // Update last login - FIXED
     user.lastLogin = new Date().toISOString();
-    users.set(email.toLowerCase(), user);
+    await user.save();
     
     // Generate JWT token
     const token = jwt.sign(
@@ -930,7 +931,7 @@ const user = await User.findOne({ email: email.toLowerCase() });
     );
     
     // Return user data (without password)
-    const { password: _, ...userWithoutPassword } = user;
+    const { password: _, ...userWithoutPassword } = user.toObject();
     
     console.log(`User logged in: ${email}`);
     
@@ -945,17 +946,17 @@ const user = await User.findOne({ email: email.toLowerCase() });
   }
 });
 
-// Get user profile endpoint
+// Get user profile endpoint - FIXED VERSION
 app.get('/profile', authenticateToken, async (req, res) => {
   try {
-    const user = users.get(req.user.email);
+    const user = await User.findOne({ email: req.user.email });
     
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
     
     // Return user data (without password)
-    const { password: _, ...userWithoutPassword } = user;
+    const { password: _, ...userWithoutPassword } = user.toObject();
     
     res.json({
       user: userWithoutPassword
@@ -966,11 +967,11 @@ app.get('/profile', authenticateToken, async (req, res) => {
   }
 });
 
-// Update user profile endpoint
+// Update user profile endpoint - FIXED VERSION
 app.put('/profile', authenticateToken, async (req, res) => {
   try {
     const { name, preferences } = req.body;
-    const user = users.get(req.user.email);
+    const user = await User.findOne({ email: req.user.email });
     
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
@@ -981,10 +982,10 @@ app.put('/profile', authenticateToken, async (req, res) => {
     if (preferences) user.preferences = preferences;
     user.updatedAt = new Date().toISOString();
     
-    users.set(req.user.email, user);
+    await user.save();
     
     // Return updated user data (without password)
-    const { password: _, ...userWithoutPassword } = user;
+    const { password: _, ...userWithoutPassword } = user.toObject();
     
     res.json({
       message: 'Profile updated successfully',
@@ -996,12 +997,12 @@ app.put('/profile', authenticateToken, async (req, res) => {
   }
 });
 
-// Activate account endpoint (for after payment)
+// Activate account endpoint - FIXED VERSION
 app.post('/activate-account', async (req, res) => {
   try {
     const { email, paymentId } = req.body;
     
-    const user = users.get(email.toLowerCase());
+    const user = await User.findOne({ email: email.toLowerCase() });
     
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
@@ -1012,13 +1013,13 @@ app.post('/activate-account', async (req, res) => {
     user.paymentId = paymentId;
     user.activatedAt = new Date().toISOString();
     
-    users.set(email.toLowerCase(), user);
+    await user.save();
     
     console.log(`Account activated for: ${email}`);
     
     res.json({
       message: 'Account activated successfully',
-      user: { ...user, password: undefined }
+      user: { ...user.toObject(), password: undefined }
     });
   } catch (error) {
     console.error('Account activation error:', error);
@@ -1026,122 +1027,18 @@ app.post('/activate-account', async (req, res) => {
   }
 });
 
-// MODIFY YOUR EXISTING CHAT ENDPOINT TO USE AUTHENTICATION
-// Replace your existing /chat endpoint with this enhanced version:
-
-app.post('/chat', async (req, res) => {
+// Debug endpoint - FIXED VERSION
+app.get('/debug-users', async (req, res) => {
   try {
-    const { message, context } = req.body;
+    const users = await User.find({}, { password: 0 }); // Exclude passwords
     
-    if (!message) {
-      return res.status(400).json({ error: 'Message is required' });
-    }
-
-    // Check if user is authenticated
-    const authHeader = req.headers['authorization'];
-    let userId;
-    let userEmail = null;
-    
-    if (authHeader) {
-      try {
-        const token = authHeader.split(' ')[1];
-        const decoded = jwt.verify(token, JWT_SECRET);
-        userId = decoded.fingerprint; // Use the stored fingerprint
-        userEmail = decoded.email;
-        console.log(`Authenticated chat for user: ${userEmail}`);
-      } catch (tokenError) {
-        console.log('Invalid token, using anonymous chat');
-        userId = generateUserFingerprint(req);
-      }
-    } else {
-      // Anonymous user
-      userId = generateUserFingerprint(req);
-      console.log(`Anonymous chat for user: ${userId}`);
-    }
-
-    // Your assistant already exists, no need to create it
-    console.log('Using existing assistant:', assistantId);
-
-    // Get thread for this user
-    const threadId = await getOrCreateThread(userId);
-
-    // Add user message to thread
-    await openai.beta.threads.messages.create(threadId, {
-      role: "user",
-      content: message
+    res.json({
+      totalUsers: users.length,
+      users: users,
+      coupons: Object.keys(VALID_COUPONS)
     });
-
-    // Create run with proper instructions that include user memory search
-    let additionalInstructions = '';
-    if (userEmail) {
-      additionalInstructions = `Authenticated User: ${userEmail} (ID: ${userId}) - `;
-    } else {
-      additionalInstructions = `Anonymous User (ID: ${userId}) - `;
-    }
-    
-    if (context && context.includes('structured question sequence')) {
-      additionalInstructions += `You are responding to an answer in a structured coaching sequence. Give a brief, encouraging response that acknowledges their answer and may reference previous responses for patterns, but do not ask follow-up questions. Search your attached files for relevant course material AND any user profile for user ${userId} to maintain continuity.`;
-    } else if (context && context.includes('Current path:')) {
-      additionalInstructions += `${context}. Always search through your attached course files and reference relevant content when applicable. ALSO search for user profile ${userId} to maintain conversation continuity.`;
-    } else {
-      additionalInstructions += `Search through your attached course files and reference relevant content from the uploaded materials when responding to the user's question. MOST IMPORTANTLY: Search for and reference the user profile file for ${userId} to maintain conversation continuity and build on past insights. If you find their profile, acknowledge previous work and connect it to current conversation.`;
-    }
-
-    const run = await openai.beta.threads.runs.create(threadId, {
-      assistant_id: assistantId,
-      additional_instructions: additionalInstructions
-    });
-
-    // Wait for completion
-    const completedRun = await waitForCompletion(threadId, run.id);
-
-    if (completedRun.status === 'completed') {
-      // Get the assistant's response
-      const messages = await openai.beta.threads.messages.list(threadId);
-      const lastMessage = messages.data[0];
-      
-      if (lastMessage.role === 'assistant') {
-        const responseText = lastMessage.content[0].text.value;
-        res.json({ 
-          message: responseText,
-          userId: userId,
-          authenticated: !!userEmail
-        });
-      } else {
-        throw new Error('No assistant response found');
-      }
-    } else {
-      console.error('Run failed:', completedRun.status, completedRun.last_error);
-      throw new Error(`Assistant run failed: ${completedRun.status}`);
-    }
-
   } catch (error) {
-    console.error('Server Error:', error);
-    res.status(500).json({ 
-      error: 'Something went wrong. Please try again.' 
-    });
+    console.error('Debug users error:', error);
+    res.status(500).json({ error: 'Failed to get users' });
   }
 });
-
-// Debug endpoint to list users (remove in production)
-app.get('/debug-users', (req, res) => {
-  const userList = Array.from(users.values()).map(user => ({
-    email: user.email,
-    name: user.name,
-    planType: user.planType,
-    isActive: user.isActive,
-    createdAt: user.createdAt,
-    chatFingerprint: user.chatFingerprint
-  }));
-  
-  res.json({
-    totalUsers: users.size,
-    users: userList,
-    coupons: Object.keys(VALID_COUPONS)
-  });
-});
-
-// ADD THIS TO THE END OF YOUR FILE
-console.log('Authentication system initialized');
-console.log('Valid coupon codes:', Object.keys(VALID_COUPONS));
-startServer();
