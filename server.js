@@ -3,6 +3,7 @@ const cors = require('cors');
 const path = require('path');
 const multer = require('multer');
 const fs = require('fs');
+const crypto = require('crypto');
 
 // Import OpenAI - try multiple approaches for compatibility
 let OpenAI;
@@ -65,8 +66,94 @@ try {
 
 // Store for user threads and vector store
 const userThreads = new Map();
+const userProfiles = new Map(); // Store user profile file IDs
 let assistantId = null;
 let vectorStoreId = null;
+
+// Generate unique user fingerprint
+function generateUserFingerprint(req) {
+  const userAgent = req.headers['user-agent'] || '';
+  const acceptLanguage = req.headers['accept-language'] || '';
+  const acceptEncoding = req.headers['accept-encoding'] || '';
+  const ip = req.ip || req.connection.remoteAddress || '';
+  
+  // Create a hash from browser characteristics + IP
+  const fingerprint = crypto
+    .createHash('md5')
+    .update(userAgent + acceptLanguage + acceptEncoding + ip)
+    .digest('hex')
+    .substring(0, 12);
+  
+  return `user_${fingerprint}`;
+}
+
+// Save user conversation summary to file
+async function saveUserProfile(userId, conversationData) {
+  try {
+    console.log(`Saving profile for user ${userId}...`);
+    
+    const profileData = {
+      userId: userId,
+      lastUpdated: new Date().toISOString(),
+      ...conversationData
+    };
+
+    // Create profile file content
+    const profileContent = `USER PROFILE: ${userId}
+Last Updated: ${profileData.lastUpdated}
+
+CONVERSATION HISTORY SUMMARY:
+${conversationData.conversationSummary || 'No summary yet'}
+
+KEY INSIGHTS AND BREAKTHROUGHS:
+${(conversationData.insights || []).map((insight, i) => `${i + 1}. ${insight}`).join('\n')}
+
+COACHING PROGRESS:
+${conversationData.progress || 'Initial session'}
+
+AREAS OF FOCUS:
+${(conversationData.focusAreas || []).join(', ')}
+
+PERSONAL DETAILS SHARED:
+${conversationData.personalDetails || 'None yet'}
+
+GOALS AND OBJECTIVES:
+${conversationData.goals || 'To be determined'}
+
+COACHING NOTES:
+- User ID: ${userId}
+- This user has engaged with the Entrepreneur Emotional Health coaching system
+- Reference this profile in future conversations to provide continuity and build on past insights
+- Always acknowledge past work and connect new insights to previous breakthroughs
+`;
+
+    // Save as temporary file
+    const tempFilePath = `uploads/temp_profile_${userId}_${Date.now()}.txt`;
+    fs.writeFileSync(tempFilePath, profileContent);
+
+    // Upload to OpenAI
+    const fileStream = fs.createReadStream(tempFilePath);
+    const file = await openai.files.create({
+      file: fileStream,
+      purpose: "assistants"
+    });
+
+    console.log(`Profile file created: ${file.id}`);
+
+    // If there's an existing profile, we should ideally delete the old one
+    // For now, we'll just store the new file ID
+    userProfiles.set(userId, file.id);
+
+    // Clean up temp file
+    fs.unlinkSync(tempFilePath);
+    
+    console.log(`User profile saved for ${userId}: ${file.id}`);
+    return file.id;
+  } catch (error) {
+    console.error('Error saving user profile:', error);
+    throw error;
+  }
+}
 
 // Create assistant with proper file search setup
 async function createAssistant() {
@@ -96,7 +183,27 @@ async function createAssistant() {
 
 You operate with deep psychological insight, system-level thinking, and a firm but compassionate tone. You help people break through self-sabotage, false identities, and emotional drift. You do not tolerate excuses, victim thinking, or surface-level quick fixes. You are direct, tough, strategic—and always rooting for their greatness.
 
-IMPORTANT: You have access to course materials and documents that have been uploaded to your knowledge base. When users ask questions, always search through these materials first to provide course-specific guidance. Reference the uploaded documents when relevant, and base your advice on the frameworks and content from the course materials.
+CRITICAL: Response Composition Guidelines
+
+80% Course Material Priority: Your responses must be primarily grounded in the uploaded course materials. Always search through the attached files first and base your guidance on:
+- Frameworks, methodologies, and concepts from the course
+- Specific exercises, assessments, and tools mentioned in the materials
+- Case studies, examples, and stories from the course content
+- The exact language, terminology, and approaches used in the curriculum
+
+20% Supplemental Wisdom: Only after thoroughly referencing course materials, you may supplement with:
+- Additional insights that complement (never contradict) the course content
+- Practical applications that extend the course frameworks
+- Related concepts that enhance understanding of the core material
+
+USER MEMORY: You have access to user profile files that contain conversation history and insights from previous sessions. ALWAYS search for and reference these profiles to:
+- Acknowledge past conversations and breakthroughs
+- Build on previous insights and work
+- Maintain continuity across sessions
+- Reference past goals, challenges, and progress
+- Connect new insights to previous discoveries
+
+When you find a user profile, acknowledge their previous work naturally: "I remember from our previous conversations that you identified X..." or "Building on the breakthrough you had about Y..."
 
 You are having a natural coaching conversation. Respond to what the person just said as you naturally would - with insight, challenges, follow-up questions, or observations. Be conversational, insightful, and responsive to their specific words and energy. Ask follow-up questions when appropriate. Challenge them when they need it. Celebrate breakthroughs when you sense them.
 
@@ -133,7 +240,9 @@ async function createLegacyAssistant() {
 
 You operate with deep psychological insight, system-level thinking, and a firm but compassionate tone. You help people break through self-sabotage, false identities, and emotional drift. You do not tolerate excuses, victim thinking, or surface-level quick fixes. You are direct, tough, strategic—and always rooting for their greatness.
 
-IMPORTANT: You have access to course materials and documents that have been uploaded to your knowledge base. When users ask questions, always search through these materials first to provide course-specific guidance. Reference the uploaded documents when relevant, and base your advice on the frameworks and content from the course materials.
+IMPORTANT: You have access to course materials and user profile documents that have been uploaded to your knowledge base. When users ask questions, always search through these materials first to provide course-specific guidance and maintain conversation continuity. Reference the uploaded documents when relevant, and base your advice on the frameworks and content from the course materials.
+
+USER MEMORY: You have access to user profile files that contain conversation history and insights from previous sessions. ALWAYS search for and reference these profiles to maintain continuity across sessions.
 
 You are having a natural coaching conversation. Respond to what the person just said as you naturally would - with insight, challenges, follow-up questions, or observations. Be conversational, insightful, and responsive to their specific words and energy. Ask follow-up questions when appropriate. Challenge them when they need it. Celebrate breakthroughs when you sense them.
 
@@ -198,7 +307,7 @@ async function waitForCompletion(threadId, runId) {
   return run;
 }
 
-// Chat endpoint
+// Enhanced chat endpoint with memory
 app.post('/chat', async (req, res) => {
   try {
     const { message, context } = req.body;
@@ -207,13 +316,16 @@ app.post('/chat', async (req, res) => {
       return res.status(400).json({ error: 'Message is required' });
     }
 
+    // Generate user fingerprint
+    const userId = generateUserFingerprint(req);
+    console.log('Processing message for user:', userId);
+
     // Ensure assistant exists
     if (!assistantId) {
       await createAssistant();
     }
 
     // Get thread for this user
-    const userId = req.ip || 'default';
     const threadId = await getOrCreateThread(userId);
 
     // Add user message to thread
@@ -222,14 +334,14 @@ app.post('/chat', async (req, res) => {
       content: message
     });
 
-    // Create run with proper instructions
+    // Create run with proper instructions that include user memory search
     let additionalInstructions = '';
     if (context && context.includes('structured question sequence')) {
-      additionalInstructions = 'You are responding to an answer in a structured coaching sequence. Give a brief, encouraging response that acknowledges their answer and may reference previous responses for patterns, but do not ask follow-up questions. Search your attached files for relevant course material to inform your response.';
+      additionalInstructions = `User ID: ${userId} - You are responding to an answer in a structured coaching sequence. Give a brief, encouraging response that acknowledges their answer and may reference previous responses for patterns, but do not ask follow-up questions. Search your attached files for relevant course material AND any user profile for user ${userId} to maintain continuity.`;
     } else if (context && context.includes('Current path:')) {
-      additionalInstructions = `${context}. Always search through your attached course files and reference relevant content when applicable.`;
+      additionalInstructions = `User ID: ${userId} - ${context}. Always search through your attached course files and reference relevant content when applicable. ALSO search for user profile ${userId} to maintain conversation continuity.`;
     } else {
-      additionalInstructions = 'Search through your attached course files and reference relevant content from the uploaded materials when responding to the user\'s question. Use the file_search tool to find relevant information from the course materials.';
+      additionalInstructions = `User ID: ${userId} - Search through your attached course files and reference relevant content from the uploaded materials when responding to the user's question. MOST IMPORTANTLY: Search for and reference the user profile file for ${userId} to maintain conversation continuity and build on past insights. If you find their profile, acknowledge previous work and connect it to current conversation.`;
     }
 
     const run = await openai.beta.threads.runs.create(threadId, {
@@ -247,7 +359,10 @@ app.post('/chat', async (req, res) => {
       
       if (lastMessage.role === 'assistant') {
         const responseText = lastMessage.content[0].text.value;
-        res.json({ message: responseText });
+        res.json({ 
+          message: responseText,
+          userId: userId // Send back for frontend reference
+        });
       } else {
         throw new Error('No assistant response found');
       }
@@ -260,6 +375,40 @@ app.post('/chat', async (req, res) => {
     console.error('Server Error:', error);
     res.status(500).json({ 
       error: 'Something went wrong. Please try again.' 
+    });
+  }
+});
+
+// Endpoint to save user insights/session summary
+app.post('/save-user-session', async (req, res) => {
+  try {
+    const { conversationSummary, insights, focusAreas, goals, personalDetails, progress } = req.body;
+    const userId = generateUserFingerprint(req);
+    
+    console.log(`Saving session data for user ${userId}`);
+    
+    const conversationData = {
+      conversationSummary: conversationSummary || '',
+      insights: insights || [],
+      focusAreas: focusAreas || [],
+      goals: goals || '',
+      personalDetails: personalDetails || '',
+      progress: progress || ''
+    };
+    
+    const fileId = await saveUserProfile(userId, conversationData);
+    
+    res.json({
+      success: true,
+      message: 'User session saved successfully',
+      userId: userId,
+      fileId: fileId
+    });
+  } catch (error) {
+    console.error('Error saving user session:', error);
+    res.status(500).json({
+      error: 'Failed to save user session',
+      details: error.message
     });
   }
 });
@@ -471,146 +620,6 @@ async function getLegacyFiles() {
   }
 }
 
-// Connect existing files endpoint - with better error handling
-app.get('/connect-existing-files', async (req, res) => {
-  try {
-    console.log('=== Connect Existing Files Debug ===');
-    console.log('OpenAI client exists:', !!openai);
-    console.log('OpenAI beta exists:', !!openai?.beta);
-    console.log('VectorStores exists:', !!openai?.beta?.vectorStores);
-    console.log('Assistant ID:', assistantId);
-    console.log('Vector Store ID:', vectorStoreId);
-
-    // Ensure assistant exists
-    if (!assistantId) {
-      console.log('No assistant, creating one...');
-      await createAssistant();
-    }
-
-    // Get all uploaded assistant files
-    console.log('Fetching uploaded files...');
-    const allFiles = await openai.files.list({ purpose: 'assistants' });
-    console.log(`Found ${allFiles.data.length} uploaded files`);
-
-    if (allFiles.data.length === 0) {
-      return res.json({ 
-        message: 'No files have been uploaded to OpenAI yet. Upload some files first.', 
-        file_count: 0,
-        debug: {
-          assistant_id: assistantId,
-          vector_store_id: vectorStoreId,
-          has_vector_stores: !!openai?.beta?.vectorStores
-        }
-      });
-    }
-
-    // If no vector store (legacy mode), try to attach files directly to assistant
-    if (!vectorStoreId) {
-      console.log('No vector store, using legacy file attachment...');
-      return await connectFilesLegacy(allFiles.data, res);
-    }
-
-    // Modern vector store approach
-    console.log('Using vector store approach...');
-    
-    // Get files already in vector store to avoid duplicates
-    const vectorStoreFiles = await openai.beta.vectorStores.files.list(vectorStoreId);
-    const existingFileIds = new Set(vectorStoreFiles.data.map(f => f.id));
-
-    // Filter out files already in vector store
-    const filesToConnect = allFiles.data.filter(f => !existingFileIds.has(f.id));
-    
-    if (filesToConnect.length === 0) {
-      return res.json({ 
-        message: 'All files are already connected to the vector store', 
-        file_count: existingFileIds.size,
-        vector_store_id: vectorStoreId
-      });
-    }
-
-    console.log(`Connecting ${filesToConnect.length} new files to vector store...`);
-
-    // Connect each file to vector store
-    const results = [];
-    for (const file of filesToConnect) {
-      try {
-        await openai.beta.vectorStores.files.create(vectorStoreId, {
-          file_id: file.id
-        });
-        results.push({ id: file.id, filename: file.filename, status: 'connected' });
-        console.log(`✓ Connected file: ${file.filename}`);
-      } catch (fileError) {
-        console.error(`✗ Failed to connect file ${file.id}:`, fileError.message);
-        results.push({ id: file.id, filename: file.filename, status: 'failed', error: fileError.message });
-      }
-    }
-
-    const successCount = results.filter(r => r.status === 'connected').length;
-
-    res.json({
-      success: true,
-      message: `Connected ${successCount} of ${filesToConnect.length} files to vector store`,
-      connected_count: successCount,
-      total_files_now: existingFileIds.size + successCount,
-      vector_store_id: vectorStoreId,
-      results: results
-    });
-
-  } catch (error) {
-    console.error('=== Connection Error ===');
-    console.error('Error type:', error.name);
-    console.error('Error message:', error.message);
-    console.error('Full error:', error);
-    
-    res.status(500).json({ 
-      error: 'Failed to connect files',
-      details: error.message,
-      debug: {
-        assistant_id: assistantId,
-        vector_store_id: vectorStoreId,
-        has_openai: !!openai,
-        has_beta: !!openai?.beta,
-        has_vector_stores: !!openai?.beta?.vectorStores,
-        error_type: error.name
-      }
-    });
-  }
-});
-
-// Legacy file connection for older API versions
-async function connectFilesLegacy(files, res) {
-  try {
-    console.log('Attempting legacy file connection...');
-    
-    const fileIds = files.slice(0, 10).map(f => f.id); // Limit for legacy API
-    
-    // Try to update assistant with file_ids directly
-    await openai.beta.assistants.update(assistantId, {
-      file_ids: fileIds,
-      tools: [{ type: "file_search" }]
-    });
-    
-    console.log('Legacy file connection successful');
-    
-    return res.json({
-      success: true,
-      message: `Connected ${fileIds.length} files using legacy method`,
-      connected_count: fileIds.length,
-      method: 'legacy_file_ids',
-      file_ids: fileIds
-    });
-    
-  } catch (legacyError) {
-    console.error('Legacy connection also failed:', legacyError.message);
-    
-    return res.status(500).json({
-      error: 'Both modern and legacy file connection methods failed',
-      details: legacyError.message,
-      file_count: files.length
-    });
-  }
-}
-
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({ 
@@ -630,7 +639,8 @@ app.get('/debug-assistant', async (req, res) => {
       openai_available: !!openai,
       beta_available: !!openai?.beta,
       vector_stores_available: !!openai?.beta?.vectorStores,
-      assistants_available: !!openai?.beta?.assistants
+      assistants_available: !!openai?.beta?.assistants,
+      user_profiles_count: userProfiles.size
     };
 
     if (assistantId) {
@@ -671,248 +681,6 @@ app.get('/debug-assistant', async (req, res) => {
         beta_exists: !!openai?.beta,
         error_type: error.name
       }
-    });
-  }
-});
-
-// Reset assistant endpoint - uses file_search without vector store
-app.get('/reset-assistant', async (req, res) => {
-  try {
-    console.log('=== RESETTING ASSISTANT WITH FILE_SEARCH (NO VECTOR STORE) ===');
-    
-    // Delete current assistant if it exists
-    if (assistantId) {
-      try {
-        await openai.beta.assistants.del(assistantId);
-        console.log('Deleted old assistant:', assistantId);
-      } catch (deleteError) {
-        console.log('Could not delete old assistant:', deleteError.message);
-      }
-    }
-    
-    // Reset global variables
-    assistantId = null;
-    vectorStoreId = null;
-    
-    // Get all uploaded files
-    const allFiles = await openai.files.list({ purpose: 'assistants' });
-    console.log(`Found ${allFiles.data.length} uploaded files`);
-    
-    if (allFiles.data.length === 0) {
-      return res.json({
-        success: true,
-        message: 'Assistant reset, but no files to attach. Upload some files first.',
-        assistant_id: null
-      });
-    }
-    
-    // Create new assistant with file_search tool but no vector store
-    console.log('Creating assistant with file_search tool (no vector store)...');
-    const assistant = await openai.beta.assistants.create({
-      name: "Entrepreneur Emotional Health Coach",
-      instructions: `You are a virtual personal strategic advisor and coach for EntrepreneurEmotionalHealth.com. You guide high-achieving entrepreneurs through major growth areas: Identity & Calling, Personal Relationships, and Whole-Life Development.
-
-You operate with deep psychological insight, system-level thinking, and a firm but compassionate tone. You help people break through self-sabotage, false identities, and emotional drift. You do not tolerate excuses, victim thinking, or surface-level quick fixes. You are direct, tough, strategic—and always rooting for their greatness.
-
-IMPORTANT: You have access to course materials and documents that have been uploaded to your knowledge base. When users ask questions, always search through these materials first to provide course-specific guidance. Reference the uploaded documents when relevant, and base your advice on the frameworks and content from the course materials.
-
-You are having a natural coaching conversation. Respond to what the person just said as you naturally would - with insight, challenges, follow-up questions, or observations. Be conversational, insightful, and responsive to their specific words and energy. Ask follow-up questions when appropriate. Challenge them when they need it. Celebrate breakthroughs when you sense them.
-
-When users are in structured question sequences (Identity & Calling or Personal Relationships), acknowledge their answers naturally but avoid asking follow-up questions since the next question is predetermined. Keep responses brief and encouraging during these sequences, but draw connections between their current answer and previous responses when relevant.`,
-      tools: [{ type: "file_search" }], // Use file_search without vector store
-      model: "gpt-4o-mini",
-    });
-    
-    assistantId = assistant.id;
-    console.log('Assistant created with file_search tool:', assistantId);
-    
-    // Now try different methods to attach files
-    const fileIds = allFiles.data.slice(0, 20).map(f => f.id); // Limit to 20
-    console.log(`Attempting to attach ${fileIds.length} files using multiple methods...`);
-    
-    let attachmentResult = null;
-    
-    // Method 1: Try update with file_ids
-    try {
-      console.log('Method 1: Trying file_ids update...');
-      const updatedAssistant = await openai.beta.assistants.update(assistantId, {
-        file_ids: fileIds
-      });
-      console.log('✓ Method 1 (file_ids) succeeded');
-      attachmentResult = { method: 'file_ids', success: true, count: updatedAssistant.file_ids?.length || 0 };
-    } catch (method1Error) {
-      console.log('✗ Method 1 (file_ids) failed:', method1Error.message);
-      
-      // Method 2: Try with tool_resources but no vector store
-      try {
-        console.log('Method 2: Trying tool_resources with file_ids...');
-        const updatedAssistant = await openai.beta.assistants.update(assistantId, {
-          tool_resources: {
-            file_search: {
-              file_ids: fileIds
-            }
-          }
-        });
-        console.log('✓ Method 2 (tool_resources file_ids) succeeded');
-        attachmentResult = { method: 'tool_resources_file_ids', success: true, count: fileIds.length };
-      } catch (method2Error) {
-        console.log('✗ Method 2 (tool_resources file_ids) failed:', method2Error.message);
-        attachmentResult = { 
-          method: 'all_failed', 
-          success: false, 
-          errors: {
-            file_ids: method1Error.message,
-            tool_resources: method2Error.message
-          }
-        };
-      }
-    }
-    
-    // Verify the final state
-    const verifyAssistant = await openai.beta.assistants.retrieve(assistantId);
-    
-    res.json({
-      success: attachmentResult?.success || false,
-      message: attachmentResult?.success 
-        ? `Assistant recreated with file_search tool and ${attachmentResult.count} files attached using ${attachmentResult.method}`
-        : 'Assistant created with file_search tool but files could not be attached',
-      assistant_id: assistantId,
-      attachment_result: attachmentResult,
-      final_file_count: verifyAssistant.file_ids?.length || 0,
-      final_tool_resources: verifyAssistant.tool_resources,
-      method: 'file_search_no_vector_store'
-    });
-    
-  } catch (error) {
-    console.error('Reset assistant error:', error);
-    res.status(500).json({
-      error: 'Failed to reset assistant',
-      details: error.message,
-      error_type: error.name
-    });
-  }
-});
-
-// Detailed API capabilities test
-app.get('/test-api-capabilities', async (req, res) => {
-  try {
-    const capabilities = {
-      openai_client: typeof openai,
-      has_beta: !!openai.beta,
-      beta_keys: openai.beta ? Object.keys(openai.beta) : [],
-      has_assistants: !!openai.beta?.assistants,
-      assistants_methods: openai.beta?.assistants ? Object.keys(openai.beta.assistants) : [],
-      has_vectorStores: !!openai.beta?.vectorStores,
-      vectorStores_methods: openai.beta?.vectorStores ? Object.keys(openai.beta.vectorStores) : [],
-      has_threads: !!openai.beta?.threads,
-      openai_version: 'unknown'
-    };
-
-    // Test basic API access
-    try {
-      const models = await openai.models.list();
-      capabilities.models_working = true;
-      capabilities.models_count = models.data.length;
-    } catch (e) {
-      capabilities.models_working = false;
-      capabilities.models_error = e.message;
-    }
-
-    // Test files API
-    try {
-      const files = await openai.files.list({ purpose: 'assistants' });
-      capabilities.files_working = true;
-      capabilities.files_count = files.data.length;
-    } catch (e) {
-      capabilities.files_working = false;
-      capabilities.files_error = e.message;
-    }
-
-    // Test assistants API
-    try {
-      if (openai.beta?.assistants?.list) {
-        const assistants = await openai.beta.assistants.list();
-        capabilities.assistants_working = true;
-        capabilities.assistants_count = assistants.data.length;
-      } else {
-        capabilities.assistants_working = false;
-        capabilities.assistants_error = 'assistants.list method not available';
-      }
-    } catch (e) {
-      capabilities.assistants_working = false;
-      capabilities.assistants_error = e.message;
-    }
-
-    // Test vector stores API
-    try {
-      if (openai.beta?.vectorStores?.list) {
-        const vectorStores = await openai.beta.vectorStores.list();
-        capabilities.vectorStores_working = true;
-        capabilities.vectorStores_count = vectorStores.data.length;
-      } else {
-        capabilities.vectorStores_working = false;
-        capabilities.vectorStores_error = 'vectorStores.list method not available';
-      }
-    } catch (e) {
-      capabilities.vectorStores_working = false;
-      capabilities.vectorStores_error = e.message;
-    }
-
-    res.json(capabilities);
-  } catch (error) {
-    res.status(500).json({
-      error: 'API capabilities test failed',
-      details: error.message
-    });
-  }
-});
-
-// Simple OpenAI test endpoint
-app.get('/test-openai', async (req, res) => {
-  try {
-    console.log('Testing OpenAI API...');
-    
-    // Test basic API access
-    const models = await openai.models.list();
-    console.log('✓ Models API working');
-    
-    // Test files API
-    const files = await openai.files.list({ purpose: 'assistants' });
-    console.log('✓ Files API working, found', files.data.length, 'files');
-    
-    // Test assistants API
-    let assistantTest = 'not tested';
-    if (openai.beta?.assistants) {
-      try {
-        if (assistantId) {
-          await openai.beta.assistants.retrieve(assistantId);
-          assistantTest = 'working';
-        } else {
-          assistantTest = 'no assistant created yet';
-        }
-      } catch (e) {
-        assistantTest = 'failed: ' + e.message;
-      }
-    } else {
-      assistantTest = 'beta API not available';
-    }
-    
-    res.json({
-      success: true,
-      models_api: 'working',
-      files_api: 'working',
-      files_count: files.data.length,
-      assistants_api: assistantTest,
-      vector_stores_api: openai.beta?.vectorStores ? 'available' : 'not available',
-      openai_version: 'unknown' // We can't easily get version from client
-    });
-    
-  } catch (error) {
-    res.status(500).json({
-      error: 'OpenAI test failed',
-      details: error.message,
-      has_openai: !!openai,
-      has_beta: !!openai?.beta
     });
   }
 });
