@@ -675,10 +675,10 @@ app.get('/debug-assistant', async (req, res) => {
   }
 });
 
-// Reset assistant endpoint - uses retrieval tool (old method)
+// Reset assistant endpoint - uses file_search without vector store
 app.get('/reset-assistant', async (req, res) => {
   try {
-    console.log('=== RESETTING ASSISTANT WITH RETRIEVAL TOOL ===');
+    console.log('=== RESETTING ASSISTANT WITH FILE_SEARCH (NO VECTOR STORE) ===');
     
     // Delete current assistant if it exists
     if (assistantId) {
@@ -706,8 +706,8 @@ app.get('/reset-assistant', async (req, res) => {
       });
     }
     
-    // Create new assistant with retrieval tool (old method)
-    console.log('Creating assistant with retrieval tool...');
+    // Create new assistant with file_search tool but no vector store
+    console.log('Creating assistant with file_search tool (no vector store)...');
     const assistant = await openai.beta.assistants.create({
       name: "Entrepreneur Emotional Health Coach",
       instructions: `You are a virtual personal strategic advisor and coach for EntrepreneurEmotionalHealth.com. You guide high-achieving entrepreneurs through major growth areas: Identity & Calling, Personal Relationships, and Whole-Life Development.
@@ -719,50 +719,69 @@ IMPORTANT: You have access to course materials and documents that have been uplo
 You are having a natural coaching conversation. Respond to what the person just said as you naturally would - with insight, challenges, follow-up questions, or observations. Be conversational, insightful, and responsive to their specific words and energy. Ask follow-up questions when appropriate. Challenge them when they need it. Celebrate breakthroughs when you sense them.
 
 When users are in structured question sequences (Identity & Calling or Personal Relationships), acknowledge their answers naturally but avoid asking follow-up questions since the next question is predetermined. Keep responses brief and encouraging during these sequences, but draw connections between their current answer and previous responses when relevant.`,
-      tools: [{ type: "retrieval" }], // Use old retrieval tool
+      tools: [{ type: "file_search" }], // Use file_search without vector store
       model: "gpt-4o-mini",
     });
     
     assistantId = assistant.id;
-    console.log('Assistant created with retrieval tool:', assistantId);
+    console.log('Assistant created with file_search tool:', assistantId);
     
-    // Now manually attach files using the update method
+    // Now try different methods to attach files
     const fileIds = allFiles.data.slice(0, 20).map(f => f.id); // Limit to 20
-    console.log(`Attempting to attach ${fileIds.length} files...`);
+    console.log(`Attempting to attach ${fileIds.length} files using multiple methods...`);
     
+    let attachmentResult = null;
+    
+    // Method 1: Try update with file_ids
     try {
-      // Try to update assistant with files
+      console.log('Method 1: Trying file_ids update...');
       const updatedAssistant = await openai.beta.assistants.update(assistantId, {
         file_ids: fileIds
       });
+      console.log('✓ Method 1 (file_ids) succeeded');
+      attachmentResult = { method: 'file_ids', success: true, count: updatedAssistant.file_ids?.length || 0 };
+    } catch (method1Error) {
+      console.log('✗ Method 1 (file_ids) failed:', method1Error.message);
       
-      console.log('Files attached successfully via update method');
-      
-      // Verify the attachment
-      const verifyAssistant = await openai.beta.assistants.retrieve(assistantId);
-      
-      res.json({
-        success: true,
-        message: `Assistant recreated with retrieval tool and ${verifyAssistant.file_ids?.length || 0} files attached`,
-        assistant_id: assistantId,
-        attached_files: verifyAssistant.file_ids?.length || 0,
-        method: 'retrieval_tool_with_update',
-        file_ids: verifyAssistant.file_ids
-      });
-      
-    } catch (updateError) {
-      console.error('File attachment via update failed:', updateError.message);
-      
-      // Assistant created but files not attached
-      res.json({
-        success: false,
-        message: 'Assistant created but files could not be attached',
-        assistant_id: assistantId,
-        attached_files: 0,
-        error: updateError.message,
-        method: 'retrieval_tool_only'
-      });
+      // Method 2: Try with tool_resources but no vector store
+      try {
+        console.log('Method 2: Trying tool_resources with file_ids...');
+        const updatedAssistant = await openai.beta.assistants.update(assistantId, {
+          tool_resources: {
+            file_search: {
+              file_ids: fileIds
+            }
+          }
+        });
+        console.log('✓ Method 2 (tool_resources file_ids) succeeded');
+        attachmentResult = { method: 'tool_resources_file_ids', success: true, count: fileIds.length };
+      } catch (method2Error) {
+        console.log('✗ Method 2 (tool_resources file_ids) failed:', method2Error.message);
+        attachmentResult = { 
+          method: 'all_failed', 
+          success: false, 
+          errors: {
+            file_ids: method1Error.message,
+            tool_resources: method2Error.message
+          }
+        };
+      }
     }
+    
+    // Verify the final state
+    const verifyAssistant = await openai.beta.assistants.retrieve(assistantId);
+    
+    res.json({
+      success: attachmentResult?.success || false,
+      message: attachmentResult?.success 
+        ? `Assistant recreated with file_search tool and ${attachmentResult.count} files attached using ${attachmentResult.method}`
+        : 'Assistant created with file_search tool but files could not be attached',
+      assistant_id: assistantId,
+      attachment_result: attachmentResult,
+      final_file_count: verifyAssistant.file_ids?.length || 0,
+      final_tool_resources: verifyAssistant.tool_resources,
+      method: 'file_search_no_vector_store'
+    });
     
   } catch (error) {
     console.error('Reset assistant error:', error);
