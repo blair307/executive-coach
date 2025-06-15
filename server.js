@@ -17,18 +17,24 @@ mongoose.connect(MONGODB_URI)
 
 // User storage design (like designing a filing folder)
 const userSchema = new mongoose.Schema({
-  id: String,
-  name: String,
-  email: String,
-  password: String,
-  planType: { type: String, default: 'free' },
-  isActive: { type: Boolean, default: false },
-  conversations: [{ 
-    message: String, 
-    response: String, 
-    timestamp: Date 
-  }],
-  createdAt: { type: Date, default: Date.now }
+    id: { type: String, required: true, unique: true },
+    name: { type: String, required: true },
+    email: { type: String, required: true, unique: true },
+    password: { type: String, required: true },
+    planType: { type: String, default: 'free' },
+    isActive: { type: Boolean, default: false },
+    
+    // Payment tracking fields
+    paymentId: String,
+    paymentAmount: Number,
+    paymentDate: Date,
+    subscriptionStatus: { type: String, default: 'inactive' },
+    couponUsed: String,
+    
+    // Existing fields
+    conversations: { type: Array, default: [] },
+    createdAt: { type: Date, default: Date.now },
+    chatFingerprint: String
 });
 
 const User = mongoose.model('User', userSchema);
