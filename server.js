@@ -675,10 +675,10 @@ app.get('/debug-assistant', async (req, res) => {
   }
 });
 
-// Reset assistant endpoint - recreates assistant with vector store approach
+// Reset assistant endpoint - uses retrieval tool (old method)
 app.get('/reset-assistant', async (req, res) => {
   try {
-    console.log('=== RESETTING ASSISTANT WITH VECTOR STORE ===');
+    console.log('=== RESETTING ASSISTANT WITH RETRIEVAL TOOL ===');
     
     // Delete current assistant if it exists
     if (assistantId) {
@@ -687,16 +687,6 @@ app.get('/reset-assistant', async (req, res) => {
         console.log('Deleted old assistant:', assistantId);
       } catch (deleteError) {
         console.log('Could not delete old assistant:', deleteError.message);
-      }
-    }
-    
-    // Delete current vector store if it exists
-    if (vectorStoreId) {
-      try {
-        await openai.beta.vectorStores.del(vectorStoreId);
-        console.log('Deleted old vector store:', vectorStoreId);
-      } catch (deleteError) {
-        console.log('Could not delete old vector store:', deleteError.message);
       }
     }
     
@@ -716,37 +706,8 @@ app.get('/reset-assistant', async (req, res) => {
       });
     }
     
-    // Create vector store first
-    console.log('Creating new vector store...');
-    const vectorStore = await openai.beta.vectorStores.create({
-      name: "Course Materials Vector Store Reset"
-    });
-    vectorStoreId = vectorStore.id;
-    console.log('Vector store created:', vectorStoreId);
-    
-    // Add files to vector store (limit to 20)
-    const fileIds = allFiles.data.slice(0, 20).map(f => f.id);
-    console.log(`Adding ${fileIds.length} files to vector store...`);
-    
-    const fileResults = [];
-    for (const fileId of fileIds) {
-      try {
-        await openai.beta.vectorStores.files.create(vectorStoreId, {
-          file_id: fileId
-        });
-        fileResults.push({ id: fileId, status: 'added' });
-        console.log(`✓ Added file ${fileId} to vector store`);
-      } catch (fileError) {
-        console.error(`✗ Failed to add file ${fileId}:`, fileError.message);
-        fileResults.push({ id: fileId, status: 'failed', error: fileError.message });
-      }
-    }
-    
-    const successfulFiles = fileResults.filter(f => f.status === 'added').length;
-    console.log(`Successfully added ${successfulFiles} files to vector store`);
-    
-    // Create new assistant with vector store
-    console.log('Creating new assistant with vector store...');
+    // Create new assistant with retrieval tool (old method)
+    console.log('Creating assistant with retrieval tool...');
     const assistant = await openai.beta.assistants.create({
       name: "Entrepreneur Emotional Health Coach",
       instructions: `You are a virtual personal strategic advisor and coach for EntrepreneurEmotionalHealth.com. You guide high-achieving entrepreneurs through major growth areas: Identity & Calling, Personal Relationships, and Whole-Life Development.
@@ -758,31 +719,50 @@ IMPORTANT: You have access to course materials and documents that have been uplo
 You are having a natural coaching conversation. Respond to what the person just said as you naturally would - with insight, challenges, follow-up questions, or observations. Be conversational, insightful, and responsive to their specific words and energy. Ask follow-up questions when appropriate. Challenge them when they need it. Celebrate breakthroughs when you sense them.
 
 When users are in structured question sequences (Identity & Calling or Personal Relationships), acknowledge their answers naturally but avoid asking follow-up questions since the next question is predetermined. Keep responses brief and encouraging during these sequences, but draw connections between their current answer and previous responses when relevant.`,
-      tools: [{ type: "file_search" }],
-      tool_resources: {
-        file_search: {
-          vector_store_ids: [vectorStoreId]
-        }
-      },
+      tools: [{ type: "retrieval" }], // Use old retrieval tool
       model: "gpt-4o-mini",
     });
     
     assistantId = assistant.id;
-    console.log('New assistant created successfully:', assistantId);
+    console.log('Assistant created with retrieval tool:', assistantId);
     
-    // Verify the setup
-    const verifyAssistant = await openai.beta.assistants.retrieve(assistantId);
-    const verifyVectorStore = await openai.beta.vectorStores.files.list(vectorStoreId);
+    // Now manually attach files using the update method
+    const fileIds = allFiles.data.slice(0, 20).map(f => f.id); // Limit to 20
+    console.log(`Attempting to attach ${fileIds.length} files...`);
     
-    res.json({
-      success: true,
-      message: `Assistant recreated successfully with vector store containing ${verifyVectorStore.data.length} files`,
-      assistant_id: assistantId,
-      vector_store_id: vectorStoreId,
-      files_in_vector_store: verifyVectorStore.data.length,
-      file_results: fileResults,
-      method: 'vector_store'
-    });
+    try {
+      // Try to update assistant with files
+      const updatedAssistant = await openai.beta.assistants.update(assistantId, {
+        file_ids: fileIds
+      });
+      
+      console.log('Files attached successfully via update method');
+      
+      // Verify the attachment
+      const verifyAssistant = await openai.beta.assistants.retrieve(assistantId);
+      
+      res.json({
+        success: true,
+        message: `Assistant recreated with retrieval tool and ${verifyAssistant.file_ids?.length || 0} files attached`,
+        assistant_id: assistantId,
+        attached_files: verifyAssistant.file_ids?.length || 0,
+        method: 'retrieval_tool_with_update',
+        file_ids: verifyAssistant.file_ids
+      });
+      
+    } catch (updateError) {
+      console.error('File attachment via update failed:', updateError.message);
+      
+      // Assistant created but files not attached
+      res.json({
+        success: false,
+        message: 'Assistant created but files could not be attached',
+        assistant_id: assistantId,
+        attached_files: 0,
+        error: updateError.message,
+        method: 'retrieval_tool_only'
+      });
+    }
     
   } catch (error) {
     console.error('Reset assistant error:', error);
