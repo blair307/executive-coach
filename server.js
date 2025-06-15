@@ -732,10 +732,6 @@ const jwt = require('jsonwebtoken');
 // Add these after your existing middleware
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
 
-// Simple in-memory user storage (replace with database later)
-const users = new Map();
-const userSessions = new Map();
-
 // Valid coupon codes
 const VALID_COUPONS = {
   'KAJABI2025': { discount: 100, type: 'percent', description: 'Course Student Access' },
@@ -855,7 +851,8 @@ app.post('/register', async (req, res) => {
     };
     
     // Store user
-    users.set(email.toLowerCase(), user);
+const newUser = new User(user);
+await newUser.save();
     
     // Generate JWT token
     const token = jwt.sign(
@@ -895,7 +892,7 @@ app.post('/login', async (req, res) => {
     }
     
     // Find user
-    const user = users.get(email.toLowerCase());
+const user = await User.findOne({ email: email.toLowerCase() });
     
     if (!user) {
       return res.status(401).json({ error: 'Invalid email or password' });
