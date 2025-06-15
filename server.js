@@ -1052,3 +1052,173 @@ async function startServer() {
 }
 
 startServer();
+
+// ADD THESE TO YOUR server.js FILE
+
+// Add Stripe using environment variable (secure!)
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+
+// Add these new endpoints to your server.js:
+
+// Create Payment Intent endpoint
+app.post('/create-payment-intent', async (req, res) => {
+    try {
+        const { amount, currency = 'usd', email, planType } = req.body;
+        
+        // Validate amount
+        if (!amount || amount < 50) {
+            return res.status(400).json({ error: 'Invalid amount' });
+        }
+        
+        // Create payment intent
+        const paymentIntent = await stripe.paymentIntents.create({
+            amount: amount, // Amount in cents
+            currency: currency,
+            metadata: {
+                email: email,
+                planType: planType,
+                timestamp: Date.now().toString()
+            },
+            receipt_email: email
+        });
+        
+        console.log('Payment Intent created:', paymentIntent.id);
+        
+        res.json({
+            client_secret: paymentIntent.client_secret,
+            payment_intent_id: paymentIntent.id
+        });
+        
+    } catch (error) {
+        console.error('Create payment intent error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Updated activate-account endpoint with better payment tracking
+app.post('/activate-account', async (req, res) => {
+    try {
+        const { email, paymentId, planType, amount } = req.body;
+        
+        if (!email || !paymentId) {
+            return res.status(400).json({ error: 'Email and payment ID required' });
+        }
+        
+        // Find user by email
+        const user = await User.findOne({ email: email });
+        if (!user) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+        
+        // Update user with payment information
+        user.isActive = true;
+        user.planType = planType || 'monthly';
+        user.paymentId = paymentId;
+        user.paymentAmount = amount;
+        user.paymentDate = new Date();
+        user.subscriptionStatus = 'active';
+        
+        await user.save();
+        
+        console.log('Account activated for:', email, 'Payment:', paymentId);
+        
+        res.json({
+            success: true,
+            user: {
+                id: user.id,
+                name: user.name,
+                email: user.email,
+                planType: user.planType,
+                isActive: user.isActive
+            }
+        });
+        
+    } catch (error) {
+        console.error('Account activation error:', error);
+        res.status(500).json({ error: 'Failed to activate account' });
+    }
+});
+
+// Stripe webhook endpoint (IMPORTANT for production)
+app.post('/webhook/stripe', express.raw({type: 'application/json'}), async (req, res) => {
+    const sig = req.headers['stripe-signature'];
+    const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
+    
+    let event;
+    
+    try {
+        event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
+    } catch (err) {
+        console.log('Webhook signature verification failed.', err.message);
+        return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+    
+    // Handle the event
+    switch (event.type) {
+        case 'payment_intent.succeeded':
+            const paymentIntent = event.data.object;
+            console.log('Payment succeeded:', paymentIntent.id);
+            
+            // Update user account based on successful payment
+            try {
+                const email = paymentIntent.metadata.email;
+                const user = await User.findOne({ email: email });
+                
+                if (user) {
+                    user.isActive = true;
+                    user.subscriptionStatus = 'active';
+                    user.paymentId = paymentIntent.id;
+                    await user.save();
+                    console.log('User activated via webhook:', email);
+                }
+            } catch (error) {
+                console.error('Webhook user update error:', error);
+            }
+            break;
+            
+        case 'payment_intent.payment_failed':
+            const failedPayment = event.data.object;
+            console.log('Payment failed:', failedPayment.id);
+            break;
+            
+        default:
+            console.log(`Unhandled event type ${event.type}`);
+    }
+    
+    res.json({received: true});
+});
+
+// Updated validate-coupon endpoint with better discounts
+app.post('/validate-coupon', async (req, res) => {
+    try {
+        const { couponCode } = req.body;
+        
+        // Define your coupon codes and discounts
+        const validCoupons = {
+            'KAJABI2025': { discount: 100, description: 'Course Student Access' },
+            'COURSE2025': { discount: 100, description: 'Course Student Access' },
+            'STUDENT50': { discount: 50, description: 'Student Discount' },
+            'LAUNCH25': { discount: 25, description: 'Launch Special' },
+            'FRIEND15': { discount: 15, description: 'Friend Referral' }
+        };
+        
+        const coupon = validCoupons[couponCode?.toUpperCase()];
+        
+        if (coupon) {
+            res.json({
+                valid: true,
+                discount: coupon.discount,
+                description: coupon.description
+            });
+        } else {
+            res.json({
+                valid: false,
+                error: 'Invalid coupon code'
+            });
+        }
+        
+    } catch (error) {
+        console.error('Coupon validation error:', error);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
