@@ -675,10 +675,10 @@ app.get('/debug-assistant', async (req, res) => {
   }
 });
 
-// Reset assistant endpoint - recreates assistant with proper file connections
+// Reset assistant endpoint - recreates assistant with vector store approach
 app.get('/reset-assistant', async (req, res) => {
   try {
-    console.log('=== RESETTING ASSISTANT ===');
+    console.log('=== RESETTING ASSISTANT WITH VECTOR STORE ===');
     
     // Delete current assistant if it exists
     if (assistantId) {
@@ -686,7 +686,17 @@ app.get('/reset-assistant', async (req, res) => {
         await openai.beta.assistants.del(assistantId);
         console.log('Deleted old assistant:', assistantId);
       } catch (deleteError) {
-        console.log('Could not delete old assistant (might not exist):', deleteError.message);
+        console.log('Could not delete old assistant:', deleteError.message);
+      }
+    }
+    
+    // Delete current vector store if it exists
+    if (vectorStoreId) {
+      try {
+        await openai.beta.vectorStores.del(vectorStoreId);
+        console.log('Deleted old vector store:', vectorStoreId);
+      } catch (deleteError) {
+        console.log('Could not delete old vector store:', deleteError.message);
       }
     }
     
@@ -696,7 +706,7 @@ app.get('/reset-assistant', async (req, res) => {
     
     // Get all uploaded files
     const allFiles = await openai.files.list({ purpose: 'assistants' });
-    console.log(`Found ${allFiles.data.length} uploaded files to attach`);
+    console.log(`Found ${allFiles.data.length} uploaded files`);
     
     if (allFiles.data.length === 0) {
       return res.json({
@@ -706,11 +716,37 @@ app.get('/reset-assistant', async (req, res) => {
       });
     }
     
-    // Take first 20 files (OpenAI limit)
-    const fileIds = allFiles.data.slice(0, 20).map(f => f.id);
-    console.log(`Will attach ${fileIds.length} files to new assistant`);
+    // Create vector store first
+    console.log('Creating new vector store...');
+    const vectorStore = await openai.beta.vectorStores.create({
+      name: "Course Materials Vector Store Reset"
+    });
+    vectorStoreId = vectorStore.id;
+    console.log('Vector store created:', vectorStoreId);
     
-    // Create new assistant with files attached directly
+    // Add files to vector store (limit to 20)
+    const fileIds = allFiles.data.slice(0, 20).map(f => f.id);
+    console.log(`Adding ${fileIds.length} files to vector store...`);
+    
+    const fileResults = [];
+    for (const fileId of fileIds) {
+      try {
+        await openai.beta.vectorStores.files.create(vectorStoreId, {
+          file_id: fileId
+        });
+        fileResults.push({ id: fileId, status: 'added' });
+        console.log(`✓ Added file ${fileId} to vector store`);
+      } catch (fileError) {
+        console.error(`✗ Failed to add file ${fileId}:`, fileError.message);
+        fileResults.push({ id: fileId, status: 'failed', error: fileError.message });
+      }
+    }
+    
+    const successfulFiles = fileResults.filter(f => f.status === 'added').length;
+    console.log(`Successfully added ${successfulFiles} files to vector store`);
+    
+    // Create new assistant with vector store
+    console.log('Creating new assistant with vector store...');
     const assistant = await openai.beta.assistants.create({
       name: "Entrepreneur Emotional Health Coach",
       instructions: `You are a virtual personal strategic advisor and coach for EntrepreneurEmotionalHealth.com. You guide high-achieving entrepreneurs through major growth areas: Identity & Calling, Personal Relationships, and Whole-Life Development.
@@ -723,30 +759,37 @@ You are having a natural coaching conversation. Respond to what the person just 
 
 When users are in structured question sequences (Identity & Calling or Personal Relationships), acknowledge their answers naturally but avoid asking follow-up questions since the next question is predetermined. Keep responses brief and encouraging during these sequences, but draw connections between their current answer and previous responses when relevant.`,
       tools: [{ type: "file_search" }],
-      file_ids: fileIds, // Direct file attachment
+      tool_resources: {
+        file_search: {
+          vector_store_ids: [vectorStoreId]
+        }
+      },
       model: "gpt-4o-mini",
     });
     
     assistantId = assistant.id;
     console.log('New assistant created successfully:', assistantId);
-    console.log('Files attached:', assistant.file_ids?.length || 0);
     
-    // Verify the files are attached
+    // Verify the setup
     const verifyAssistant = await openai.beta.assistants.retrieve(assistantId);
+    const verifyVectorStore = await openai.beta.vectorStores.files.list(vectorStoreId);
     
     res.json({
       success: true,
-      message: `Assistant recreated successfully with ${verifyAssistant.file_ids?.length || 0} files attached`,
+      message: `Assistant recreated successfully with vector store containing ${verifyVectorStore.data.length} files`,
       assistant_id: assistantId,
-      attached_files: verifyAssistant.file_ids?.length || 0,
-      method: 'direct_file_ids'
+      vector_store_id: vectorStoreId,
+      files_in_vector_store: verifyVectorStore.data.length,
+      file_results: fileResults,
+      method: 'vector_store'
     });
     
   } catch (error) {
     console.error('Reset assistant error:', error);
     res.status(500).json({
       error: 'Failed to reset assistant',
-      details: error.message
+      details: error.message,
+      error_type: error.name
     });
   }
 });
