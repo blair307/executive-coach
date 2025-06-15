@@ -6,7 +6,7 @@ const multer = require('multer');
 const fs = require('fs');
 const crypto = require('crypto');
 
-const MONGODB_URI = 'mongodb+srv://blair:G%26%26Li%2F%26Y%21_E92Mw@cluster0.hcheocu.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0';
+const MONGODB_URI = 'mongodb+srv://blair:G00dgvnr%211234567@cluster0.hcheocu.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0';
 
 // Connect to MongoDB
 mongoose.connect(MONGODB_URI)
