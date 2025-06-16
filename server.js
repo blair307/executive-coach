@@ -380,6 +380,30 @@ async function waitForCompletion(threadId, runId) {
   return run;
 }
 
+// NEW: Check if there are any active runs on the thread (RACE CONDITION FIX)
+async function checkForActiveRuns(threadId) {
+  try {
+    const runs = await openai.beta.threads.runs.list(threadId);
+    const activeRun = runs.data.find(run => 
+      run.status === 'in_progress' || 
+      run.status === 'queued' || 
+      run.status === 'requires_action'
+    );
+    
+    if (activeRun) {
+      console.log(`Found active run ${activeRun.id}, waiting for completion...`);
+      // Wait for the active run to complete
+      await waitForCompletion(threadId, activeRun.id);
+      console.log(`Active run ${activeRun.id} completed`);
+    }
+    
+    return true;
+  } catch (error) {
+    console.error('Error checking for active runs:', error);
+    return false;
+  }
+}
+
 // AUTHENTICATION ENDPOINTS
 
 // Validate coupon endpoint
@@ -623,7 +647,7 @@ app.post('/activate-account', async (req, res) => {
   }
 });
 
-// Enhanced chat endpoint with authentication
+// Enhanced chat endpoint with authentication and RACE CONDITION FIX
 app.post('/chat', async (req, res) => {
   try {
     const { message, context } = req.body;
@@ -659,6 +683,9 @@ app.post('/chat', async (req, res) => {
 
     // Get thread for this user
     const threadId = await getOrCreateThread(userId);
+
+    // RACE CONDITION FIX: Check for active runs before adding message
+    await checkForActiveRuns(threadId);
 
     // Add user message to thread
     await openai.beta.threads.messages.create(threadId, {
