@@ -729,6 +729,114 @@ app.post('/chat', async (req, res) => {
   }
 });
 
+// NEW: Streaming chat endpoint for GPT-4o Assistant API
+app.post('/chat-stream', async (req, res) => {
+  try {
+    const { message, context } = req.body;
+    
+    if (!message) {
+      return res.status(400).json({ error: 'Message is required' });
+    }
+
+    // Set headers for streaming
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+
+    // Check if user is authenticated
+    const authHeader = req.headers['authorization'];
+    let userId;
+    let userEmail = null;
+    
+    if (authHeader) {
+      try {
+        const token = authHeader.split(' ')[1];
+        const decoded = jwt.verify(token, JWT_SECRET);
+        userId = decoded.fingerprint;
+        userEmail = decoded.email;
+        console.log(`Authenticated streaming chat for user: ${userEmail}`);
+      } catch (tokenError) {
+        console.log('Invalid token, using anonymous streaming chat');
+        userId = generateUserFingerprint(req);
+      }
+    } else {
+      userId = generateUserFingerprint(req);
+      console.log(`Anonymous streaming chat for user: ${userId}`);
+    }
+
+    // Get thread for this user
+    const threadId = await getOrCreateThread(userId);
+
+    // RACE CONDITION FIX: Check for active runs before adding message
+    await checkForActiveRuns(threadId);
+
+    // Add user message to thread
+    await openai.beta.threads.messages.create(threadId, {
+      role: "user",
+      content: message
+    });
+
+    // Create run with streaming
+    let additionalInstructions = '';
+    if (userEmail) {
+      additionalInstructions = `Authenticated User: ${userEmail} (ID: ${userId}) - `;
+    } else {
+      additionalInstructions = `Anonymous User (ID: ${userId}) - `;
+    }
+    
+    if (context && context.includes('structured question sequence')) {
+      additionalInstructions += `You are responding to an answer in a structured coaching sequence. Give a brief, encouraging response that acknowledges their answer and may reference previous responses for patterns, but do not ask follow-up questions. Search your attached files for relevant course material AND any user profile for user ${userId} to maintain continuity.`;
+    } else if (context && context.includes('Current path:')) {
+      additionalInstructions += `${context}. Always search through your attached course files and reference relevant content when applicable. ALSO search for user profile ${userId} to maintain conversation continuity.`;
+    } else {
+      additionalInstructions += `Search through your attached course files and reference relevant content from the uploaded materials when responding to the user's question. MOST IMPORTANTLY: Search for and reference the user profile file for ${userId} to maintain conversation continuity and build on past insights. If you find their profile, acknowledge previous work and connect it to current conversation.`;
+    }
+
+    // Create streaming run using Assistant API
+    const run = await openai.beta.threads.runs.create(threadId, {
+      assistant_id: assistantId,
+      additional_instructions: additionalInstructions,
+      stream: true
+    });
+
+    // Handle streaming response
+    for await (const event of run) {
+      if (event.event === 'thread.message.delta') {
+        const delta = event.data.delta;
+        if (delta.content) {
+          for (const contentDelta of delta.content) {
+            if (contentDelta.type === 'text' && contentDelta.text?.value) {
+              res.write(contentDelta.text.value);
+            }
+          }
+        }
+      } else if (event.event === 'thread.run.completed') {
+        break;
+      } else if (event.event === 'thread.run.failed') {
+        console.error('Streaming run failed:', event.data.last_error);
+        res.write('\n\n[Error: Assistant response failed. Please try again.]');
+        break;
+      }
+    }
+
+    res.end();
+
+  } catch (error) {
+    console.error('Streaming Error:', error);
+    
+    // Try to send error to client if response hasn't been sent yet
+    if (!res.headersSent) {
+      res.status(500).json({ 
+        error: 'Streaming failed. Please try again.' 
+      });
+    } else {
+      res.write('\n\n[Error: Connection interrupted. Please try again.]');
+      res.end();
+    }
+  }
+});
+
 // Endpoint to save user insights/session summary
 app.post('/save-user-session', async (req, res) => {
   try {
@@ -1210,6 +1318,7 @@ app.get('/', (req, res) => {
       '/health',
       '/debug-assistant', 
       '/chat',
+      '/chat-stream',
       '/login',
       '/register',
       '/validate-coupon',
@@ -1227,6 +1336,7 @@ async function startServer() {
       console.log('✅ Authentication system initialized');
       console.log('✅ Valid coupon codes:', Object.keys(VALID_COUPONS));
       console.log('✅ Race condition fix applied');
+      console.log('✅ GPT-4o streaming endpoint added');
       console.log(stripe ? '✅ Stripe payment system ready' : '⚠️ Stripe not available');
       console.log('Ready to create assistant and vector store when needed');
     });
