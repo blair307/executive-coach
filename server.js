@@ -57,6 +57,20 @@ try {
   process.exit(1);
 }
 
+// Try to import Stripe, but don't fail if it's not available
+let stripe = null;
+try {
+  if (process.env.STRIPE_SECRET_KEY) {
+    const Stripe = require('stripe');
+    stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+    console.log('✅ Stripe initialized successfully');
+  } else {
+    console.log('⚠️ STRIPE_SECRET_KEY not found - Stripe features disabled');
+  }
+} catch (error) {
+  console.log('⚠️ Stripe not installed - Payment features disabled');
+}
+
 const app = express();
 
 app.use(cors({
@@ -380,7 +394,7 @@ async function waitForCompletion(threadId, runId) {
   return run;
 }
 
-// NEW: Check if there are any active runs on the thread (RACE CONDITION FIX)
+// Check if there are any active runs on the thread (RACE CONDITION FIX)
 async function checkForActiveRuns(threadId) {
   try {
     const runs = await openai.beta.threads.runs.list(threadId);
@@ -614,36 +628,6 @@ app.put('/profile', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Profile update error:', error);
     res.status(500).json({ error: 'Failed to update profile' });
-  }
-});
-
-// Activate account endpoint (for after payment)
-app.post('/activate-account', async (req, res) => {
-  try {
-    const { email, paymentId } = req.body;
-    
-    const user = await User.findOne({ email: email.toLowerCase() });
-    
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-    
-    // Activate account
-    user.isActive = true;
-    user.paymentId = paymentId;
-    user.activatedAt = new Date().toISOString();
-    
-    await user.save();
-    
-    console.log(`Account activated for: ${email}`);
-    
-    res.json({
-      message: 'Account activated successfully',
-      user: { ...user.toObject(), password: undefined }
-    });
-  } catch (error) {
-    console.error('Account activation error:', error);
-    res.status(500).json({ error: 'Failed to activate account' });
   }
 });
 
@@ -992,6 +976,7 @@ app.get('/health', (req, res) => {
     status: 'ok', 
     assistant: assistantId ? 'ready' : 'not created',
     vector_store: vectorStoreId ? 'ready' : 'not created',
+    stripe: stripe ? 'available' : 'not available',
     timestamp: new Date().toISOString()
   });
 });
@@ -1006,7 +991,8 @@ app.get('/debug-assistant', async (req, res) => {
       beta_available: !!openai?.beta,
       vector_stores_available: !!openai?.beta?.vectorStores,
       assistants_available: !!openai?.beta?.assistants,
-      user_profiles_count: userProfiles.size
+      user_profiles_count: userProfiles.size,
+      stripe_available: !!stripe
     };
 
     if (assistantId) {
@@ -1067,35 +1053,15 @@ app.get('/debug-users', async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 3000;
-
-// Start server
-async function startServer() {
-  try {
-    app.listen(PORT, () => {
-      console.log(`Server running on port ${PORT}`);
-      console.log('Authentication system initialized');
-      console.log('Valid coupon codes:', Object.keys(VALID_COUPONS));
-      console.log('Ready to create assistant and vector store when needed');
-    });
-  } catch (error) {
-    console.error('Failed to start server:', error);
-    process.exit(1);
-  }
-}
-
-startServer();
-
-// ADD THESE TO YOUR server.js FILE
-
-// Add Stripe using environment variable (secure!)
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
-
-// Add these new endpoints to your server.js:
+// PAYMENT ENDPOINTS (Only if Stripe is available)
 
 // Create Payment Intent endpoint
 app.post('/create-payment-intent', async (req, res) => {
     try {
+        if (!stripe) {
+            return res.status(503).json({ error: 'Payment system not available' });
+        }
+
         const { amount, currency = 'usd', email, planType } = req.body;
         
         // Validate amount
@@ -1128,17 +1094,17 @@ app.post('/create-payment-intent', async (req, res) => {
     }
 });
 
-// Updated activate-account endpoint with better payment tracking
+// Activate account endpoint (for after payment)
 app.post('/activate-account', async (req, res) => {
     try {
         const { email, paymentId, planType, amount } = req.body;
         
-        if (!email || !paymentId) {
-            return res.status(400).json({ error: 'Email and payment ID required' });
+        if (!email) {
+            return res.status(400).json({ error: 'Email required' });
         }
         
         // Find user by email
-        const user = await User.findOne({ email: email });
+        const user = await User.findOne({ email: email.toLowerCase() });
         if (!user) {
             return res.status(404).json({ error: 'User not found' });
         }
@@ -1146,14 +1112,14 @@ app.post('/activate-account', async (req, res) => {
         // Update user with payment information
         user.isActive = true;
         user.planType = planType || 'monthly';
-        user.paymentId = paymentId;
-        user.paymentAmount = amount;
+        if (paymentId) user.paymentId = paymentId;
+        if (amount) user.paymentAmount = amount;
         user.paymentDate = new Date();
         user.subscriptionStatus = 'active';
         
         await user.save();
         
-        console.log('Account activated for:', email, 'Payment:', paymentId);
+        console.log('Account activated for:', email, paymentId ? 'Payment:' : 'Manual:', paymentId || 'manual');
         
         res.json({
             success: true,
@@ -1172,10 +1138,19 @@ app.post('/activate-account', async (req, res) => {
     }
 });
 
-// Stripe webhook endpoint (IMPORTANT for production)
+// Stripe webhook endpoint (Only if Stripe is available)
 app.post('/webhook/stripe', express.raw({type: 'application/json'}), async (req, res) => {
+    if (!stripe) {
+        return res.status(503).json({ error: 'Stripe not available' });
+    }
+
     const sig = req.headers['stripe-signature'];
     const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
+    
+    if (!endpointSecret) {
+        console.log('Webhook secret not configured');
+        return res.status(400).json({ error: 'Webhook not configured' });
+    }
     
     let event;
     
@@ -1201,6 +1176,8 @@ app.post('/webhook/stripe', express.raw({type: 'application/json'}), async (req,
                     user.isActive = true;
                     user.subscriptionStatus = 'active';
                     user.paymentId = paymentIntent.id;
+                    user.paymentAmount = paymentIntent.amount;
+                    user.paymentDate = new Date();
                     await user.save();
                     console.log('User activated via webhook:', email);
                 }
@@ -1221,37 +1198,23 @@ app.post('/webhook/stripe', express.raw({type: 'application/json'}), async (req,
     res.json({received: true});
 });
 
-// Updated validate-coupon endpoint with better discounts
-app.post('/validate-coupon', async (req, res) => {
-    try {
-        const { couponCode } = req.body;
-        
-        // Define your coupon codes and discounts
-        const validCoupons = {
-            'KAJABI2025': { discount: 100, description: 'Course Student Access' },
-            'COURSE2025': { discount: 100, description: 'Course Student Access' },
-            'STUDENT50': { discount: 50, description: 'Student Discount' },
-            'LAUNCH25': { discount: 25, description: 'Launch Special' },
-            'FRIEND15': { discount: 15, description: 'Friend Referral' }
-        };
-        
-        const coupon = validCoupons[couponCode?.toUpperCase()];
-        
-        if (coupon) {
-            res.json({
-                valid: true,
-                discount: coupon.discount,
-                description: coupon.description
-            });
-        } else {
-            res.json({
-                valid: false,
-                error: 'Invalid coupon code'
-            });
-        }
-        
-    } catch (error) {
-        console.error('Coupon validation error:', error);
-        res.status(500).json({ error: 'Server error' });
-    }
-});
+const PORT = process.env.PORT || 3000;
+
+// Start server
+async function startServer() {
+  try {
+    app.listen(PORT, () => {
+      console.log(`🚀 Server running on port ${PORT}`);
+      console.log('✅ Authentication system initialized');
+      console.log('✅ Valid coupon codes:', Object.keys(VALID_COUPONS));
+      console.log('✅ Race condition fix applied');
+      console.log(stripe ? '✅ Stripe payment system ready' : '⚠️ Stripe not available');
+      console.log('Ready to create assistant and vector store when needed');
+    });
+  } catch (error) {
+    console.error('Failed to start server:', error);
+    process.exit(1);
+  }
+}
+
+startServer();
