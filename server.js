@@ -1200,6 +1200,24 @@ app.post('/webhook/stripe', express.raw({type: 'application/json'}), async (req,
 
 const PORT = process.env.PORT || 3000;
 
+// Simple root route for Railway
+app.get('/', (req, res) => {
+  res.json({ 
+    message: 'Executive Coach API - Railway Deployment',
+    status: 'running',
+    timestamp: new Date().toISOString(),
+    endpoints: [
+      '/health',
+      '/debug-assistant', 
+      '/chat',
+      '/login',
+      '/register',
+      '/validate-coupon',
+      '/upload-course-material'
+    ]
+  });
+});
+
 // Start server
 async function startServer() {
   try {
