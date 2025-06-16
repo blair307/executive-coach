@@ -1203,8 +1203,9 @@ const PORT = process.env.PORT || 3000;
 // Start server
 async function startServer() {
   try {
-    app.listen(PORT, () => {
-      console.log(`🚀 Server running on port ${PORT}`);
+  app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log('✅ Railway deployment ready');
       console.log('✅ Authentication system initialized');
       console.log('✅ Valid coupon codes:', Object.keys(VALID_COUPONS));
       console.log('✅ Race condition fix applied');
